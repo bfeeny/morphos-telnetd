@@ -1,0 +1,24 @@
+# Private agent context — vault paths, fleet conventions, machine details.
+# Never commit: this repo is intended to become public.
+.claude/CLAUDE.local.md
+CLAUDE.local.md
+
+# Secrets
+.env
+.env.*
+*.key
+secrets/
+
+# Build artifacts
+build/
+out/
+dist/
+*.o
+*.a
+*.elf
+
+# macOS
+.DS_Store
+
+# built probe binary (PPC, rebuild with probe/Makefile)
+probe/conprobe
