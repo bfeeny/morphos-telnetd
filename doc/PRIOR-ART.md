@@ -45,8 +45,10 @@ before they are legal:
 - **Entry point.** It builds `NOSTARTUP` with `int __asm main(register __a0
   char *, register __d0 long)` — an m68k register-argument entry. Meaningless
   on PowerPC.
-- **`SysBase` is read from absolute address 4** (`telnetd.c:173`). Not valid on
-  MorphOS.
+- **`SysBase` is read from absolute address 4** (`telnetd.c:173`) — legal, but
+  it comes bundled with the m68k assumptions around it. *(An earlier draft of
+  this file called that read invalid on MorphOS. It is not: the SDK's own
+  `Examples/Misc/procmessages.c` does exactly the same thing. Corrected.)*
 - **SAS/C throughout** — `SCOPTIONS` with `PARAMETERS=REGISTERS`, `smakefile`
   driving `sc` and `slink`, `__asm`/`register __aN` declarations.
 - **Auth is AmiTCP's**, via `usergroup.library` and a DES `passwd` file. Neither
@@ -96,8 +98,15 @@ curl -O https://aminet.net/comm/tcp/ttyhandler.lha
 ## Deployment precedent worth keeping
 
 `ttyhandler` was launched from `inetd.conf` and started its Shell from
-`S:Remote-Startup`. MorphOS appears to ship `inetd` (`ENVARC:sys/net/inetd.conf`
-and `ENVARC:sys/net/services`) — **forum-sourced, not yet verified on
-hardware**. If it holds, running as an inetd service gets us one process per
-connection with the socket already accepted, and most of "an idiomatic way to
-start it" comes free.
+`S:Remote-Startup`.
+
+**Verified on MorphOS 3.20 hardware: the configuration ships, the daemon does
+not.** `ENVARC:sys/net/inetd.conf` exists with *every* entry commented out, and
+`ENVARC:sys/net/services` already defines `telnet 23/tcp`. No `inetd` binary in
+`C:`, `MOSSYS:C` or on the path. The disabled entries point at
+`NetWork:serv/ftpd` and `NetWork:samba/bin/smbd`, so **`NetWork:serv/`** is
+where a daemon is expected to live.
+
+That is a useful thing to be able to tell the MorphOS team: the socket
+super-server plumbing is already in place with nothing plugged into it, and the
+slot this daemon would occupy is pre-cut.
