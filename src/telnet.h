@@ -13,6 +13,7 @@
 enum TelnetParseState
 {
 	TS_DATA = 0,
+	TS_CR,		/* saw a CR: the next byte decides what it meant */
 	TS_IAC,
 	TS_VERB,
 	TS_SB_OPT,

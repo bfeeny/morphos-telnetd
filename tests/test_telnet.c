@@ -203,6 +203,50 @@ static void test_opening_offer(void)
 	CHECK(s.out[7] == 253 && s.out[8] == 31, "DO NAWS");
 }
 
+static void test_crlf_becomes_newline(void)
+{
+	struct TelnetState ts; struct Sink s;
+	unsigned char out[64];
+	long n;
+
+	printf("CR LF becomes a single newline (not CR, which breaks commands)\n");
+	setup(&ts, &s);
+
+	n = telnet_input(&ts, (const unsigned char *)"version\r\n", 9, out, sizeof(out));
+	CHECK(n == 8, "eight bytes out, not nine");
+	CHECK(memcmp(out, "version\n", 8) == 0, "the CR is gone");
+}
+
+static void test_cr_nul_is_a_bare_cr(void)
+{
+	struct TelnetState ts; struct Sink s;
+	const unsigned char in[] = { 'a', '\r', 0, 'b' };
+	unsigned char out[64];
+	long n;
+
+	printf("CR NUL is a bare carriage return, per RFC 854\n");
+	setup(&ts, &s);
+
+	n = telnet_input(&ts, in, 4, out, sizeof(out));
+	CHECK(n == 3, "three bytes");
+	CHECK(out[0]=='a' && out[1]=='\r' && out[2]=='b', "CR survives as CR");
+}
+
+static void test_crlf_split_across_reads(void)
+{
+	struct TelnetState ts; struct Sink s;
+	unsigned char out[64];
+	long a, b;
+
+	printf("CR and LF arriving in separate reads still make one newline\n");
+	setup(&ts, &s);
+
+	a = telnet_input(&ts, (const unsigned char *)"hi\r", 3, out, sizeof(out));
+	CHECK(a == 2, "only the data so far");
+	b = telnet_input(&ts, (const unsigned char *)"\n", 1, out, sizeof(out));
+	CHECK(b == 1 && out[0] == '\n', "the newline arrives with the LF");
+}
+
 int main(void)
 {
 	printf("telnet protocol front end -- host tests\n\n");
@@ -216,6 +260,9 @@ int main(void)
 	test_oversized_subnegotiation_is_bounded();
 	test_output_escapes_255();
 	test_opening_offer();
+	test_crlf_becomes_newline();
+	test_cr_nul_is_a_bare_cr();
+	test_crlf_split_across_reads();
 
 	printf("\n%d checks, %d failures\n", checks, failures);
 	return failures == 0 ? 0 : 1;

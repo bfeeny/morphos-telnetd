@@ -114,7 +114,39 @@ long telnet_input(struct TelnetState *ts,
 		{
 		case TS_DATA:
 			if (c == IAC) { ts->state = TS_IAC; break; }
+			if (c == '\r') { ts->state = TS_CR; break; }
 			if (n < out_max) out[n++] = c;
+			break;
+
+		case TS_CR:
+			/*
+			 * RFC 854: on the wire a line ends with CR LF, and a
+			 * BARE carriage return is sent as CR NUL. So the CR is
+			 * an escape, not data, and passing it through hands the
+			 * Shell "version\r" -- which it correctly rejects as an
+			 * unknown command. This is why every typed command came
+			 * back as "Unknown command".
+			 */
+			ts->state = TS_DATA;
+			if (c == '\n')                      /* CR LF -> newline */
+			{
+				if (n < out_max) out[n++] = '\n';
+			}
+			else if (c == '\0')                 /* CR NUL -> bare CR */
+			{
+				if (n < out_max) out[n++] = '\r';
+			}
+			else if (c == IAC)                  /* CR then a command */
+			{
+				if (n < out_max) out[n++] = '\n';
+				ts->state = TS_IAC;
+			}
+			else                                /* lone CR: treat as newline */
+			{
+				if (n < out_max) out[n++] = '\n';
+				if (c == '\r') { ts->state = TS_CR; break; }
+				if (n < out_max) out[n++] = c;
+			}
 			break;
 
 		case TS_IAC:

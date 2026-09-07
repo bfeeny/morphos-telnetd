@@ -439,7 +439,6 @@ static void run_session(LONG sock, LONG session_no)
 	long                ndef = 0;
 	struct TagItem      proctags[6];
 	int                 helper_done = 0;
-	int                 idle_ticks = 0;
 	LONG                yes = 1;
 
 	s = AllocVec(sizeof(struct Session), MEMF_PUBLIC | MEMF_CLEAR);
@@ -548,7 +547,6 @@ static void run_session(LONG sock, LONG session_no)
 		struct timeval tv;
 		long i;
 		LONG nready;
-		LONG before = s->con.packets;
 
 		FD_ZERO(&rd);
 		if (s->sock >= 0 && !s->peer_gone)
@@ -676,19 +674,28 @@ static void run_session(LONG sock, LONG session_no)
 			say_num("telnetd: helper finished, SystemTagList rc = ", sm->rc);
 		}
 
-		/* Nothing happened at all for a whole timeout: wind it down. */
-		say_num("telnetd: loop tick, packets so far = ", s->con.packets);
-
-		if (s->con.packets == before && !(sigs & SIGBREAKF_CTRL_C))
-		{
-			if (s->con.draining)
-			{
-				say("telnetd: session idle and not ending; giving up\n");
-				break;
-			}
-			say("telnetd: session idle; draining\n");
-			console_begin_drain(&s->con);
-		}
+		/*
+		 * NO IDLE TIMEOUT. Two attempts at one were both wrong.
+		 *
+		 * The first counted loop iterations and assumed each was a full
+		 * interval. The second was meant to require WaitSelect to report
+		 * a real timeout -- and never actually reached the file, which I
+		 * did not check before testing it twice on hardware.
+		 *
+		 * Both were the same mistake anyway: inferring elapsed time from
+		 * an event loop. Draining feeds the Shell EOF, so every wrong
+		 * guess killed a live session and looked exactly like the client
+		 * hanging up.
+		 *
+		 * Unix telnetd has no idle limit either -- an idle shell is the
+		 * normal state of a remote login, not a fault. A session ends
+		 * when the peer closes (recv() == 0), when the Shell exits, or
+		 * on CTRL-C. That is the whole policy.
+		 *
+		 * If a reaper for half-open connections is ever wanted it must
+		 * read a CLOCK -- DateStamp() or timer.device -- never the shape
+		 * of this loop.
+		 */
 	}
 
 	say("telnetd: session ended\n");
