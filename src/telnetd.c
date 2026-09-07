@@ -83,7 +83,19 @@ static int allow_no_auth = 0;
 #define SHELL_COMMAND  "NewShell " MOUNT_NAME ":"
 #define INBUF_SIZE     4096
 #define MAX_DEFERRED   8
-#define SESSION_IDLE_SECS 30	/* no packets for this long -> wind the session down */
+/*
+ * How long a session may sit doing nothing before we wind it down.
+ *
+ * Deliberately generous. Unix telnetd has no idle limit at all -- an idle
+ * shell is the normal state of a remote login, not a fault -- so this exists
+ * only as a safety net against a session nobody is attached to any more, not
+ * as a policy about how fast a person should type. Two consecutive intervals
+ * are required, so the real limit is twice this.
+ */
+#define SESSION_IDLE_SECS 300
+
+/* Time to complete a login. Matches the usual telnetd/login convention. */
+#define LOGIN_TIMEOUT_SECS 60
 
 #define HANDLE_IN   1
 #define HANDLE_OUT  2
@@ -327,11 +339,11 @@ static int authenticate(struct Session *s)
 	}
 
 	net_write_str(s, (CONST_STRPTR)"\r\nMorphOS telnetd\r\n\r\nlogin: ");
-	if (!read_line(s, user, (long)sizeof(user), 1, 60) || user[0] == '\0')
+	if (!read_line(s, user, (long)sizeof(user), 1, LOGIN_TIMEOUT_SECS) || user[0] == '\0')
 		return 0;
 
 	net_write_str(s, (CONST_STRPTR)"password: ");
-	if (!read_line(s, pass, (long)sizeof(pass), 0, 60))
+	if (!read_line(s, pass, (long)sizeof(pass), 0, LOGIN_TIMEOUT_SECS))
 		return 0;
 
 	pw = getpwnam((STRPTR)user);

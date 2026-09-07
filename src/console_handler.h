@@ -148,6 +148,21 @@ struct ConsoleState
 	int  q_state;	/* incremental match of CSI SP q across writes */
 	long size_requests;
 
+	/*
+	 * Has the Shell opened a console of its own yet?
+	 *
+	 * The two handles handed to SystemTagList() are closed by the caller as
+	 * soon as the COMMAND returns -- and "NewShell <window>" returns once it
+	 * has LAUNCHED the shell, not when that shell exits. So the initial
+	 * handles go away almost immediately while the session is just starting.
+	 *
+	 * Treating a zero handle count as "session over" therefore tore down
+	 * live sessions about two seconds in, and only when the Shell had not
+	 * yet got around to opening its own handles -- a race, which is why it
+	 * sometimes appeared to work.
+	 */
+	int  established;
+
 	int  raw_mode;	/* last ACTION_SCREEN_MODE: 1 raw, 0 cooked */
 	int  draining;	/* wind down: reads return EOF so the Shell exits */
 	int  inconsistent;	/* accounting went wrong -- never tear down */

@@ -35,6 +35,7 @@ void console_init(struct ConsoleState *st,
 	st->pending_pos  = 0;
 	st->q_state      = 0;
 	st->size_requests = 0;
+	st->established  = 0;
 	st->raw_mode     = 0;
 	st->draining     = 0;
 	st->inconsistent = (initial_handles < 0) ? 1 : 0;
@@ -50,6 +51,17 @@ int console_session_finished(const struct ConsoleState *st)
 {
 	if (st->inconsistent)
 		return 0;	/* we no longer know what is outstanding */
+
+	/*
+	 * A session is only over once the Shell has opened a console of its own
+	 * AND released everything. Before that, a zero count just means the
+	 * launcher handed its handles back -- see `established` in the header.
+	 *
+	 * A session that never establishes is ended by the caller's idle
+	 * timeout instead, so this cannot hang forever.
+	 */
+	if (!st->established)
+		return 0;
 
 	return (st->open_handles <= 0);
 }
@@ -309,6 +321,7 @@ struct ConsoleReply console_dispatch(struct ConsoleState *st,
 		 * FileHandle up; we only account for it. */
 		st->open_handles++;
 		st->opens_seen++;
+		st->established = 1;	/* the Shell has a console of its own now */
 		r.res1 = DOSTRUE;
 		break;
 

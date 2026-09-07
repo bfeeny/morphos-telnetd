@@ -223,6 +223,11 @@ static void test_session_not_finished_while_handles_are_open(void)
 	printf("session is not finished while the shell holds handles\n");
 	setup(&st, &io, "");
 
+	/* The shell opens its own console first -- until it does, the session
+	 * has not established and cannot be "finished" at all. */
+	console_dispatch(&st, ACTION_FINDOUTPUT, 0, 0, NULL, 0);
+	console_dispatch(&st, ACTION_END, 0, 0, NULL, 0);
+
 	CHECK(!console_session_finished(&st), "two handles outstanding: not finished");
 
 	console_dispatch(&st, ACTION_END, 1, 0, NULL, 0);
@@ -277,6 +282,8 @@ static void test_port_is_never_declared_safe_to_free(void)
 
 	printf("the port is NEVER declared safe to free (the one fatal mistake)\n");
 	setup(&st, &io, "");
+	console_dispatch(&st, ACTION_FINDOUTPUT, 0, 0, NULL, 0);
+	console_dispatch(&st, ACTION_END, 0, 0, NULL, 0);
 
 	CHECK(!console_safe_to_free_port(&st), "not at the start");
 
@@ -551,6 +558,44 @@ static void test_queued_size_report_is_never_deferred(void)
 	CHECK(r.res1 > 0, "the report is delivered");
 }
 
+static void test_launcher_handles_closing_is_not_session_end(void)
+{
+	struct ConsoleState st;
+	struct FakeIO io;
+
+	printf("the launcher returning its handles is NOT the session ending\n");
+	setup(&st, &io, "");
+
+	/* "NewShell <window>" returns as soon as it has launched the shell, so
+	 * the two handles we gave it come straight back -- while the real Shell
+	 * is only just starting. */
+	console_dispatch(&st, ACTION_END, 1, 0, NULL, 0);
+	console_dispatch(&st, ACTION_END, 2, 0, NULL, 0);
+
+	CHECK(st.open_handles <= 0, "handle count really is zero");
+	CHECK(!console_session_finished(&st),
+	      "but the session is NOT over -- this tore down live sessions");
+}
+
+static void test_session_ends_once_established_and_released(void)
+{
+	struct ConsoleState st;
+	struct FakeIO io;
+
+	printf("a session ends when the shell's OWN console is released\n");
+	setup(&st, &io, "");
+
+	console_dispatch(&st, ACTION_FINDOUTPUT, 0, 0, NULL, 0);   /* shell opens its own */
+	CHECK(st.established == 1, "established by the shell's own open");
+
+	console_dispatch(&st, ACTION_END, 1, 0, NULL, 0);          /* launcher's two */
+	console_dispatch(&st, ACTION_END, 2, 0, NULL, 0);
+	CHECK(!console_session_finished(&st), "shell still holds one");
+
+	console_dispatch(&st, ACTION_END, 0, 0, NULL, 0);          /* and the shell's */
+	CHECK(console_session_finished(&st), "now it is over");
+}
+
 /* ---- main -------------------------------------------------------------- */
 
 int main(void)
@@ -581,6 +626,8 @@ int main(void)
 	test_deferred_read_succeeds_when_data_arrives();
 	test_draining_beats_deferral();
 	test_queued_size_report_is_never_deferred();
+	test_launcher_handles_closing_is_not_session_end();
+	test_session_ends_once_established_and_released();
 
 	printf("\n%d checks, %d failures\n", checks, failures);
 	return failures == 0 ? 0 : 1;
