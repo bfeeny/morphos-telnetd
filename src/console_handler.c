@@ -24,6 +24,8 @@ void console_init(struct ConsoleState *st,
 	st->ends_seen    = 0;
 	st->packets      = 0;
 	st->unknown      = 0;
+	st->signal_task  = 0;
+	st->signals_seen = 0;
 	st->raw_mode     = 0;
 	st->draining     = 0;
 	st->inconsistent = (initial_handles < 0) ? 1 : 0;
@@ -168,6 +170,20 @@ struct ConsoleReply console_dispatch(struct ConsoleState *st,
 			st->open_handles = 0;
 			st->inconsistent = 1;
 		}
+		r.res1 = DOSTRUE;
+		break;
+
+	case ACTION_CHANGE_SIGNAL:
+		/*
+		 * dp_Arg1 is the task to signal from now on. Refusing this --
+		 * which we did until now, as an unknown packet -- is not
+		 * harmless: it is the console telling us who its client is.
+		 * Observed on MorphOS 3.20 as the very first packet of a
+		 * session and again at teardown.
+		 */
+		if (arg1 != 0)
+			st->signal_task = (void *)arg1;
+		st->signals_seen++;
 		r.res1 = DOSTRUE;
 		break;
 

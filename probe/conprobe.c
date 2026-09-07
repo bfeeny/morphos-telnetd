@@ -48,6 +48,8 @@
 #include <exec/ports.h>
 #include <exec/memory.h>
 #include <exec/tasks.h>
+#include <exec/io.h>
+#include <devices/timer.h>
 #include <dos/dos.h>
 #include <dos/dosextens.h>
 #include <dos/dostags.h>
@@ -88,6 +90,8 @@ struct SpawnMsg
 struct ProbeIO
 {
 	ULONG script_pos;
+	ULONG bytes_out;	/* how much the Shell actually wrote to us */
+	int   line_mode;	/* answer reads a line at a time, as cooked consoles do */
 	BPTR  out;
 };
 
@@ -169,6 +173,21 @@ static long probe_read(void *ctx, void *buf, long len)
 		return 0;	/* end of canned input == the remote hung up */
 
 	n = ((ULONG)len < avail) ? len : (long)avail;
+
+	/*
+	 * A cooked console hands over one line at a time. Answering with the
+	 * whole buffer is what a *file* does -- and a Shell reading a script may
+	 * treat "asked 200, got 127" as end-of-file, which is exactly the
+	 * behaviour we are chasing. Opt in with -l so the two cases stay
+	 * distinguishable on the wire.
+	 */
+	if (io->line_mode)
+	{
+		long i;
+		for (i = 0; i < n; i++)
+			if (script[io->script_pos + i] == '\n') { n = i + 1; break; }
+	}
+
 	CopyMem((APTR)(script + io->script_pos), buf, n);
 	io->script_pos += (ULONG)n;
 
@@ -182,6 +201,7 @@ static long probe_write(void *ctx, const void *buf, long len)
 	if (io->out)
 		Write(io->out, (APTR)buf, len);
 
+	io->bytes_out += (ULONG)len;
 	return len;
 }
 
@@ -305,8 +325,80 @@ static struct FileHandle *make_handle(struct MsgPort *port, LONG mode, LONG id)
 
 /* ------------------------------------------------------------------ */
 
+/*
+ * A self-imposed deadline.
+ *
+ * The first interactive run proved the probe could wait forever: the Shell
+ * stayed alive holding our handles, the packet loop had nothing to do, and
+ * `bounded 60` could not help because a MorphOS process parked in Wait() does
+ * not answer to a shell-level kill. It sat on the queue until the agent's own
+ * 900s watchdog fired, and the process itself survived that.
+ *
+ * An instrument that can strand the machine it measures is not finished. So
+ * the probe now carries its own clock: at the first deadline it starts
+ * draining (feed EOF, let the Shell leave of its own accord), and at the
+ * second it gives up, prints everything it learned, and exits -- leaking the
+ * port, as it always does, because that is still the safe direction.
+ */
+struct Watchdog
+{
+	struct MsgPort   *port;
+	struct timerequest *req;
+	int               open;
+	int               pending;
+};
+
+static int watchdog_start(struct Watchdog *w, ULONG secs)
+{
+	w->port = CreateMsgPort();
+	if (w->port == NULL)
+		return 0;
+
+	w->req = (struct timerequest *)CreateIORequest(w->port, sizeof(struct timerequest));
+	if (w->req == NULL)
+		return 0;
+
+	if (OpenDevice(TIMERNAME, UNIT_VBLANK, (struct IORequest *)w->req, 0) != 0)
+		return 0;
+
+	w->open = 1;
+	w->req->tr_node.io_Command = TR_ADDREQUEST;
+	w->req->tr_time.tv_secs    = secs;
+	w->req->tr_time.tv_micro   = 0;
+	SendIO((struct IORequest *)w->req);
+	w->pending = 1;
+	return 1;
+}
+
+static void watchdog_rearm(struct Watchdog *w, ULONG secs)
+{
+	if (!w->open)
+		return;
+	w->req->tr_node.io_Command = TR_ADDREQUEST;
+	w->req->tr_time.tv_secs    = secs;
+	w->req->tr_time.tv_micro   = 0;
+	SendIO((struct IORequest *)w->req);
+	w->pending = 1;
+}
+
+static void watchdog_stop(struct Watchdog *w)
+{
+	if (w->pending)
+	{
+		AbortIO((struct IORequest *)w->req);
+		WaitIO((struct IORequest *)w->req);
+		w->pending = 0;
+	}
+	if (w->open)   { CloseDevice((struct IORequest *)w->req); w->open = 0; }
+	if (w->req)    { DeleteIORequest((struct IORequest *)w->req); w->req = NULL; }
+	if (w->port)   { DeleteMsgPort(w->port); w->port = NULL; }
+}
+
 int main(int argc, char **argv)
 {
+	struct Watchdog      wd;
+	int                  gave_up = 0;
+	ULONG                deadline = 25;
 	struct ConsoleState  st;
 	struct ProbeIO       io;
 	struct Process      *me;
@@ -319,6 +411,8 @@ int main(int argc, char **argv)
 	struct TagItem       proctags[6];
 	int                  helper_done = 0;
 	int                  status = RETURN_FAIL;
+
+	memset(&wd, 0, sizeof(wd));
 
 	/*
 	 * Disable DOS requesters first. This runs over a remote queue with
@@ -369,11 +463,23 @@ int main(int argc, char **argv)
 	 * actually consume a script from our handle?). Being able to switch
 	 * without a rebuild is the difference between one round trip and three.
 	 */
-	sm->command = (argc > 1 && argv[1] && argv[1][0]) ? (CONST_STRPTR)argv[1] : NULL;
-
-	say(sm->command ? "conprobe: mode = run one command: "
-	                : "conprobe: mode = interactive (shell reads our input)\n");
-	if (sm->command) { say((CONST_STRPTR)sm->command); say("\n"); }
+	if (argc > 1 && argv[1] && argv[1][0] == '-' && argv[1][1] == 'l')
+	{
+		io.line_mode = 1;
+		sm->command  = NULL;
+		say("conprobe: mode = interactive, reads answered ONE LINE at a time\n");
+	}
+	else if (argc > 1 && argv[1] && argv[1][0])
+	{
+		sm->command = (CONST_STRPTR)argv[1];
+		say("conprobe: mode = run one command: ");
+		say((CONST_STRPTR)sm->command); say("\n");
+	}
+	else
+	{
+		sm->command = NULL;
+		say("conprobe: mode = interactive, reads answered in full\n");
+	}
 
 	console_init(&st, probe_read, probe_write, &io, 2, MAX_PACKETS);
 
@@ -393,6 +499,9 @@ int main(int argc, char **argv)
 		goto cleanup_before_helper;
 	}
 
+	if (!watchdog_start(&wd, deadline))
+		say("conprobe: WARNING -- no timer; running without a deadline\n");
+
 	say("conprobe: helper running; this process is now the console handler.\n");
 	say("conprobe: ---- shell output follows ----\n\n");
 
@@ -408,12 +517,33 @@ int main(int argc, char **argv)
 
 		sigs = Wait((1UL << port->mp_SigBit)
 		          | (1UL << replyport->mp_SigBit)
+		          | (wd.port ? (1UL << wd.port->mp_SigBit) : 0)
 		          | SIGBREAKF_CTRL_C);
 
 		if ((sigs & SIGBREAKF_CTRL_C) && !st.draining)
 		{
 			say("\nconprobe: CTRL-C -- feeding EOF, waiting for the Shell to exit\n");
 			console_begin_drain(&st);
+		}
+
+		if (wd.port && (sigs & (1UL << wd.port->mp_SigBit)))
+		{
+			while (GetMsg(wd.port) != NULL)
+				wd.pending = 0;
+
+			if (!st.draining)
+			{
+				say("\nconprobe: deadline -- draining (feeding EOF)\n");
+				console_begin_drain(&st);
+				watchdog_rearm(&wd, deadline);
+			}
+			else
+			{
+				say("\nconprobe: deadline again -- the Shell will not leave.\n");
+				say("conprobe: giving up and reporting. The Shell stays resident.\n");
+				gave_up = 1;
+				break;
+			}
 		}
 
 		/* Service the Shell first: the helper cannot finish until it does. */
@@ -443,7 +573,10 @@ int main(int argc, char **argv)
 			helper_done = 1;	/* the helper process has exited */
 	}
 
+	watchdog_stop(&wd);
+
 	say("\n\nconprobe: ---- shell output ends ----\n");
+	say_num("conprobe: gave up on deadline?  = ", (LONG)gave_up);
 	say_num("conprobe: SystemTagList rc     = ", sm->rc);
 	if (sm->rc == -1)
 		say_num("conprobe: IoErr()             = ", sm->ioerr);
@@ -454,6 +587,10 @@ int main(int argc, char **argv)
 	say_num("conprobe: closes               = ", st.ends_seen);
 	say_num("conprobe: last raw mode        = ", (LONG)st.raw_mode);
 	say_num("conprobe: accounting broken?   = ", (LONG)st.inconsistent);
+	say_num("conprobe: bytes in  (we fed)   = ", (LONG)io.script_pos);
+	say_num("conprobe: bytes out (shell)    = ", (LONG)io.bytes_out);
+	say_num("conprobe: CHANGE_SIGNALs       = ", st.signals_seen);
+	say_num("conprobe: signal task (^C tgt) = ", (LONG)st.signal_task);
 
 	{
 		LONG i;
@@ -468,10 +605,20 @@ int main(int argc, char **argv)
 			say("conprobe:   (none)\n");
 	}
 
-	if (st.packets > 0 && io.script_pos > 0)
+	if (io.bytes_out > 0 && io.script_pos > 0)
 	{
-		say("conprobe: RESULT -- the Shell read our packets. Mechanism CONFIRMED.\n");
+		say("conprobe: RESULT -- input consumed AND output produced. FULL SESSION.\n");
 		status = RETURN_OK;
+	}
+	else if (io.bytes_out > 0)
+	{
+		say("conprobe: RESULT -- output path works (shell wrote through us).\n");
+		status = RETURN_OK;
+	}
+	else if (io.script_pos > 0)
+	{
+		say("conprobe: RESULT -- input path works, but the shell produced nothing.\n");
+		status = RETURN_WARN;
 	}
 	else if (sm->started && sm->rc == -1)
 	{

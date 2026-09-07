@@ -190,6 +190,27 @@ static void test_unknown_packets_are_refused_politely(void)
 	CHECK(st.unknown == 1, "and counted, so the probe can report it");
 }
 
+static void test_change_signal_is_accepted_and_recorded(void)
+{
+	struct ConsoleState st;
+	struct FakeIO io;
+	struct ConsoleReply r;
+	long fake_task = 0x12345678;
+
+	printf("CHANGE_SIGNAL is accepted, and the task is kept\n");
+	setup(&st, &io, "");
+
+	r = console_dispatch(&st, ACTION_CHANGE_SIGNAL, fake_task, NULL, 0);
+	CHECK(r.res1 == DOSTRUE, "accepted, not refused as unknown");
+	CHECK(st.unknown == 0, "not counted as unknown");
+	CHECK(st.signal_task == (void *)fake_task, "task recorded -- this is the ^C target");
+	CHECK(st.signals_seen == 1, "counted");
+
+	/* A zero task must not wipe a good one. */
+	console_dispatch(&st, ACTION_CHANGE_SIGNAL, 0, NULL, 0);
+	CHECK(st.signal_task == (void *)fake_task, "a null task does not clear it");
+}
+
 /* ---- the ones that actually matter ------------------------------------- */
 
 static void test_session_not_finished_while_handles_are_open(void)
@@ -317,6 +338,7 @@ int main(void)
 	test_write_forwards_output();
 	test_screen_mode_records_line_discipline();
 	test_unknown_packets_are_refused_politely();
+	test_change_signal_is_accepted_and_recorded();
 	test_session_not_finished_while_handles_are_open();
 	test_opens_are_counted_so_we_do_not_finish_early();
 	test_unbalanced_close_poisons_the_accounting();

@@ -82,6 +82,16 @@ struct ConsoleState
 	long packets;	/* everything dispatched, for the cap */
 	long unknown;	/* packets we did not recognise */
 
+	/*
+	 * ACTION_CHANGE_SIGNAL hands us the task that wants to be signalled --
+	 * on a real console this is how ^C reaches the running program. We spawn
+	 * the Shell through SystemTagList() and never get a Process pointer back,
+	 * so this packet is the only route to the identity we need in order to
+	 * turn telnet's Interrupt Process into SIGBREAKF_CTRL_C.
+	 */
+	void *signal_task;
+	long  signals_seen;
+
 	int  raw_mode;	/* last ACTION_SCREEN_MODE: 1 raw, 0 cooked */
 	int  draining;	/* wind down: reads return EOF so the Shell exits */
 	int  inconsistent;	/* accounting went wrong -- never tear down */
