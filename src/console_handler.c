@@ -9,6 +9,9 @@
 
 #include "console_handler.h"
 
+/* Distinguishable from any real byte count; never escapes this file. */
+#define CONSOLE_WOULD_BLOCK (-12345L)
+
 void console_init(struct ConsoleState *st,
                   console_read_fn read_fn,
                   console_write_fn write_fn,
@@ -223,9 +226,11 @@ static long do_read(struct ConsoleState *st, void *buf, long len)
 
 	n = st->read_fn(st->io_ctx, buf, len);
 
-	/* Trust nothing a callback returns either. */
 	if (n < 0)
-		n = 0;
+		return 0;	/* real EOF: the peer is gone, let the Shell exit */
+	if (n == 0)
+		return CONSOLE_WOULD_BLOCK;	/* hold the packet instead */
+
 	if (n > len)
 	{
 		n = len;
@@ -257,8 +262,9 @@ struct ConsoleReply console_dispatch(struct ConsoleState *st,
 {
 	struct ConsoleReply r;
 
-	r.res1 = DOSFALSE;
-	r.res2 = 0;
+	r.res1  = DOSFALSE;
+	r.res2  = 0;
+	r.defer = 0;
 
 	st->packets++;
 	if (st->max_packets > 0 && st->packets > st->max_packets)
@@ -268,6 +274,11 @@ struct ConsoleReply console_dispatch(struct ConsoleState *st,
 	{
 	case ACTION_READ:
 		r.res1 = do_read(st, bufarg, len);
+		if (r.res1 == CONSOLE_WOULD_BLOCK)
+		{
+			r.res1  = 0;
+			r.defer = 1;
+		}
 		break;
 
 	case ACTION_WRITE:

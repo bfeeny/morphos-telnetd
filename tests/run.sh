@@ -24,5 +24,11 @@ trap 'rm -f "$BIN"' EXIT INT TERM
 
 $CC -std=c11 -O1 -Wall -Wextra -Werror \
     -o "$BIN" "$DIR/test_console_handler.c" "$DIR/../src/console_handler.c"
-
 "$BIN"
+
+echo
+BIN2=`mktemp -t telnet_tests` || exit 1
+trap 'rm -f "$BIN" "$BIN2"' EXIT INT TERM
+$CC -std=c11 -O1 -Wall -Wextra -Werror \
+    -o "$BIN2" "$DIR/test_telnet.c" "$DIR/../src/telnet.c"
+"$BIN2"

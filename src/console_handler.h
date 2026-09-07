@@ -53,14 +53,32 @@ struct ConsoleReply
 {
 	long res1;
 	long res2;
+
+	/*
+	 * When set, DO NOT REPLY TO THIS PACKET YET.
+	 *
+	 * A console read blocks until a key arrives. With a socket underneath,
+	 * "nothing to read right now" is the normal case, and it is NOT
+	 * end-of-file -- but replying 0 is exactly how a handler says EOF, and
+	 * the Shell would exit. So the packet is held and answered when bytes
+	 * turn up. This is the one thing a socket needs that a canned buffer
+	 * never did.
+	 */
+	int defer;
 };
 
 struct ConsoleState;
 
 /*
- * Supply bytes to the Shell. Return the number placed in buf (0 == EOF).
- * In the probe this reads a canned script; in telnetd it reads the socket.
- * Must never write more than len bytes.
+ * Supply bytes to the Shell. Must never write more than len bytes.
+ *
+ *   > 0  that many bytes were placed in buf
+ *   = 0  nothing available RIGHT NOW -- the read will be deferred, not
+ *        answered. A non-blocking socket with no data returns this.
+ *   < 0  end of file: the peer is gone. The Shell is allowed to exit.
+ *
+ * The 0/-1 distinction is the whole difference between a session that idles
+ * at a prompt and one that hangs up the moment you stop typing.
  */
 typedef long (*console_read_fn)(void *ctx, void *buf, long len);
 

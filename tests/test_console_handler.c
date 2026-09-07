@@ -40,6 +40,7 @@ struct FakeIO
 	long        out_len;
 
 	long        force_read_return;	/* if non-zero, return this instead */
+	int         eof;		/* exhausted input means EOF, not would-block */
 };
 
 static long fake_read(void *ctx, void *buf, long len)
@@ -52,7 +53,7 @@ static long fake_read(void *ctx, void *buf, long len)
 
 	avail = io->in_len - io->in_pos;
 	if (avail <= 0)
-		return 0;
+		return io->eof ? -1 : 0;	/* -1 EOF, 0 would-block */
 
 	n = (len < avail) ? len : avail;
 	memcpy(buf, io->in + io->in_pos, (size_t)n);
@@ -78,6 +79,7 @@ static void setup(struct ConsoleState *st, struct FakeIO *io, const char *input)
 	memset(io, 0, sizeof(*io));
 	io->in     = input;
 	io->in_len = input ? (long)strlen(input) : 0;
+	io->eof    = 1;	/* most tests want classic EOF behaviour */
 
 	/* 2 == SYS_Input + SYS_Output, the handles SYS_Asynch will close. */
 	console_init(st, fake_read, fake_write, io, 2, 20000);
@@ -455,6 +457,100 @@ static void test_size_reply_outranks_normal_input(void)
 	      "then the real input, undisturbed");
 }
 
+/* ---- deferred reads: the difference between idling and hanging up ------- */
+
+static void test_empty_socket_defers_rather_than_signalling_eof(void)
+{
+	struct ConsoleState st;
+	struct FakeIO io;
+	char buf[64];
+	struct ConsoleReply r;
+
+	printf("no data yet defers the read; it must NOT look like EOF\n");
+	setup(&st, &io, "");
+	io.eof = 0;	/* a live socket with nothing to say right now */
+
+	r = console_dispatch(&st, ACTION_READ, 1, 0, buf, (long)sizeof(buf));
+	CHECK(r.defer == 1, "the packet is held, not answered");
+	CHECK(r.res1 == 0, "and carries no byte count");
+}
+
+static void test_closed_socket_really_is_eof(void)
+{
+	struct ConsoleState st;
+	struct FakeIO io;
+	char buf[64];
+	struct ConsoleReply r;
+
+	printf("a closed peer IS end of file, so the shell can exit\n");
+	setup(&st, &io, "");
+	io.eof = 1;
+
+	r = console_dispatch(&st, ACTION_READ, 1, 0, buf, (long)sizeof(buf));
+	CHECK(r.defer == 0, "answered immediately");
+	CHECK(r.res1 == 0, "with EOF");
+}
+
+static void test_deferred_read_succeeds_when_data_arrives(void)
+{
+	struct ConsoleState st;
+	struct FakeIO io;
+	char buf[64];
+	struct ConsoleReply r;
+
+	printf("re-dispatching a deferred read once bytes arrive works\n");
+	setup(&st, &io, "");
+	io.eof = 0;
+
+	r = console_dispatch(&st, ACTION_READ, 1, 0, buf, (long)sizeof(buf));
+	CHECK(r.defer == 1, "deferred while the socket is quiet");
+
+	/* bytes turn up */
+	io.in = "ls\n"; io.in_len = 3; io.in_pos = 0;
+
+	memset(buf, 0, sizeof(buf));
+	r = console_dispatch(&st, ACTION_READ, 1, 0, buf, (long)sizeof(buf));
+	CHECK(r.defer == 0, "now answered");
+	CHECK(r.res1 == 3 && memcmp(buf, "ls\n", 3) == 0, "with the real input");
+}
+
+static void test_draining_beats_deferral(void)
+{
+	struct ConsoleState st;
+	struct FakeIO io;
+	char buf[64];
+	struct ConsoleReply r;
+
+	printf("while draining we answer EOF rather than hold the packet\n");
+	setup(&st, &io, "");
+	io.eof = 0;
+	console_begin_drain(&st);
+
+	r = console_dispatch(&st, ACTION_READ, 1, 0, buf, (long)sizeof(buf));
+	CHECK(r.defer == 0, "not deferred -- a held packet would never come back");
+	CHECK(r.res1 == 0, "EOF, so the Shell leaves");
+}
+
+static void test_queued_size_report_is_never_deferred(void)
+{
+	struct ConsoleState st;
+	struct FakeIO io;
+	char buf[64];
+	struct ConsoleReply r;
+	static const char q[3] = { (char)0x9B, ' ', 'q' };
+
+	printf("a queued size report answers even on a silent socket\n");
+	setup(&st, &io, "");
+	io.eof = 0;
+	console_set_window_size(&st, 24, 80);
+
+	console_dispatch(&st, ACTION_WRITE, 2, 0, (void *)q, 3);
+
+	r = console_dispatch(&st, ACTION_READ, 1, 0, buf, (long)sizeof(buf));
+	CHECK(r.defer == 0, "not deferred -- the asker is blocked on this");
+	CHECK(r.res1 > 0, "the report is delivered");
+}
+
 /* ---- main -------------------------------------------------------------- */
 
 int main(void)
@@ -480,6 +576,11 @@ int main(void)
 	test_size_answered_from_current_value();
 	test_unknown_size_reports_nothing();
 	test_size_reply_outranks_normal_input();
+	test_empty_socket_defers_rather_than_signalling_eof();
+	test_closed_socket_really_is_eof();
+	test_deferred_read_succeeds_when_data_arrives();
+	test_draining_beats_deferral();
+	test_queued_size_report_is_never_deferred();
 
 	printf("\n%d checks, %d failures\n", checks, failures);
 	return failures == 0 ? 0 : 1;
