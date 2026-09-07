@@ -70,6 +70,7 @@ static const char script[] =
 
 #define HANDLE_IN   1
 #define HANDLE_OUT  2
+#define HANDLE_OPEN 3	/* anything opened through us by name */
 #define MAX_PACKETS 20000
 
 /* Passed to the helper process, and ReplyMsg'd back to us when it exits. */
@@ -690,6 +691,43 @@ int main(int argc, char **argv)
 			reply = console_dispatch(&st, pkt->dp_Type,
 			                         pkt->dp_Arg1, pkt->dp_Arg2,
 			                         bufarg, len);
+
+			/*
+			 * Complete the open ourselves. console_handler stays free of
+			 * MorphOS types, so filling in the FileHandle is the glue's
+			 * job -- and until now nobody was doing it at all: we replied
+			 * DOSTRUE to ACTION_FIND* and left the handle untouched.
+			 *
+			 * The convention, from a shipping interactive handler
+			 * (ahi-handler/main.c:330-331):
+			 *
+			 *     fh->fh_Arg1 = (ULONG) data;
+			 *     fh->fh_Port = (LONG)(struct MsgPort *) DOS_TRUE;
+			 *
+			 * fh_Type is deliberately not set -- DOS has already pointed
+			 * it at us in order to deliver this packet. What matters is
+			 * fh_Port, which MorphOS renamed to fh_Interactive
+			 * (dos/dosextens.h:96-97): it is what IsInteractive() reports,
+			 * and a stream that answers "not interactive" is not something
+			 * NewShell will accept as a console. Non-interactive handlers
+			 * set it to 0 for exactly this reason
+			 * (ixpipe-handler.c:267, macfs-handler/packet.c:239).
+			 */
+			if (reply.res1 == DOSTRUE
+			    && (pkt->dp_Type == ACTION_FINDINPUT
+			     || pkt->dp_Type == ACTION_FINDOUTPUT
+			     || pkt->dp_Type == ACTION_FINDUPDATE))
+			{
+				struct FileHandle *nfh =
+					(struct FileHandle *)BADDR((BPTR)pkt->dp_Arg1);
+
+				if (nfh != NULL)
+				{
+					nfh->fh_Arg1        = HANDLE_OPEN;
+					nfh->fh_Interactive = DOSTRUE;
+					say("[find] handle wired, marked interactive\n");
+				}
+			}
 			trace_add(pkt->dp_Type,
 			          (pkt->dp_Type == ACTION_READ || pkt->dp_Type == ACTION_WRITE)
 			              ? len : pkt->dp_Arg1,
