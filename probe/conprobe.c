@@ -75,6 +75,7 @@ struct SpawnMsg
 {
 	struct Message msg;	/* MUST be first */
 
+	CONST_STRPTR command;	/* NULL = RUN_EXECUTE (shell reads our input) */
 	BPTR  input;		/* handles the helper hands to the Shell */
 	BPTR  output;
 	APTR  console_port;	/* our handler port, for NP_ConsoleTask */
@@ -89,6 +90,31 @@ struct ProbeIO
 	ULONG script_pos;
 	BPTR  out;
 };
+
+/*
+ * Every packet type we are sent, in order. Recorded rather than printed
+ * inline so the trace cannot interleave with the Shell's own output -- and
+ * dumped at the end even on the paths where nothing else happens.
+ *
+ * Rev 2 shipped without this and immediately needed it: the Shell sent two
+ * packet types we do not implement, and the run could not say which.
+ */
+#define TRACE_MAX 128
+static LONG trace[TRACE_MAX];
+static LONG trace_req[TRACE_MAX];	/* dp_Arg3: bytes asked for */
+static LONG trace_got[TRACE_MAX];	/* dp_Res1: what we answered */
+static LONG trace_n = 0;
+
+static void trace_add(LONG type, LONG req, LONG got)
+{
+	if (trace_n < TRACE_MAX)
+	{
+		trace[trace_n]     = type;
+		trace_req[trace_n] = req;
+		trace_got[trace_n] = got;
+		trace_n++;
+	}
+}
 
 /* ------------------------------------------------------------------ */
 
@@ -177,7 +203,7 @@ static void spawn_helper(void)
 {
 	struct SpawnMsg *sm = NULL;
 	struct TagItem   attrtags[1];
-	struct TagItem   systags[6];
+	struct TagItem   systags[7];
 
 	attrtags[0].ti_Tag = TAG_DONE;
 	attrtags[0].ti_Data = 0;
@@ -202,10 +228,40 @@ static void spawn_helper(void)
 	systags[2].ti_Tag = SYS_FilterTags; systags[2].ti_Data = (IPTR)FALSE;
 	systags[3].ti_Tag = NP_ConsoleTask; systags[3].ti_Data = (IPTR)sm->console_port;
 	systags[4].ti_Tag = NP_WindowPtr;   systags[4].ti_Data = (IPTR)-1;
-	systags[5].ti_Tag = TAG_DONE;       systags[5].ti_Data = 0;
+	/*
+	 * NP_Cli, restored -- with a caveat worth recording.
+	 *
+	 * SystemTagList() documents NP_Cli among the tags it manages itself and
+	 * does not pass through, which is why rev 2 dropped it. But we also set
+	 * SYS_FilterTags = FALSE, and that switch exists precisely to stop
+	 * SystemTagList() filtering what reaches CreateNewProc(). If filtering
+	 * off also means "manage nothing", then the tag becomes ours to supply
+	 * and its absence would explain a Shell that reads once and exits
+	 * without ever running a command.
+	 *
+	 * Untested hypothesis, deliberately isolated: this is the only change
+	 * from the run that produced READ + END + END.
+	 */
+	systags[5].ti_Tag = NP_Cli;         systags[5].ti_Data = (IPTR)TRUE;
+	systags[6].ti_Tag = TAG_DONE;       systags[6].ti_Data = 0;
 
+	/*
+	 * NULL, not "".
+	 *
+	 * Rev 2 passed an empty string and the Shell exited immediately without
+	 * ever reading: 6 packets, no ACTION_READ, rc=0. The published AROS
+	 * dos.library source explains it --
+	 *
+	 *   type = (command == NULL) ? RUN_EXECUTE
+	 *        : isAsynchronous ? RUN_SYSTEM_ASYNCH : RUN_SYSTEM;
+	 *
+	 * -- so "" is not "no command", it is RUN_SYSTEM with an empty command:
+	 * run nothing, return 0. NULL selects RUN_EXECUTE, the Execute() path,
+	 * which reads commands from SYS_Input until EOF. That is the interactive
+	 * shell we actually want.
+	 */
 	sm->started = 1;
-	sm->rc      = SystemTagList("", systags);
+	sm->rc      = SystemTagList(sm->command, systags);
 	sm->ioerr   = (LONG)IoErr();
 
 	/*
@@ -249,7 +305,7 @@ static struct FileHandle *make_handle(struct MsgPort *port, LONG mode, LONG id)
 
 /* ------------------------------------------------------------------ */
 
-int main(void)
+int main(int argc, char **argv)
 {
 	struct ConsoleState  st;
 	struct ProbeIO       io;
@@ -304,6 +360,20 @@ int main(void)
 	sm->input               = MKBADDR(fh_in);
 	sm->output              = MKBADDR(fh_out);
 	sm->console_port        = (APTR)port;
+
+	/*
+	 * With no argument: NULL command == RUN_EXECUTE, i.e. "shell, read your
+	 * commands from SYS_Input" -- the interactive case we ultimately want.
+	 * With an argument: run exactly that command, which isolates the OUTPUT
+	 * path (does ACTION_WRITE reach us?) from the INPUT path (will a shell
+	 * actually consume a script from our handle?). Being able to switch
+	 * without a rebuild is the difference between one round trip and three.
+	 */
+	sm->command = (argc > 1 && argv[1] && argv[1][0]) ? (CONST_STRPTR)argv[1] : NULL;
+
+	say(sm->command ? "conprobe: mode = run one command: "
+	                : "conprobe: mode = interactive (shell reads our input)\n");
+	if (sm->command) { say((CONST_STRPTR)sm->command); say("\n"); }
 
 	console_init(&st, probe_read, probe_write, &io, 2, MAX_PACKETS);
 
@@ -365,6 +435,7 @@ int main(void)
 
 			reply = console_dispatch(&st, pkt->dp_Type, pkt->dp_Arg1,
 			                         bufarg, len);
+			trace_add(pkt->dp_Type, len, reply.res1);
 			ReplyPkt(pkt, reply.res1, reply.res2);
 		}
 
@@ -383,6 +454,19 @@ int main(void)
 	say_num("conprobe: closes               = ", st.ends_seen);
 	say_num("conprobe: last raw mode        = ", (LONG)st.raw_mode);
 	say_num("conprobe: accounting broken?   = ", (LONG)st.inconsistent);
+
+	{
+		LONG i;
+		say("conprobe: packet trace -- type / asked / answered:\n");
+		for (i = 0; i < trace_n; i++)
+		{
+			say_num("conprobe:   type ", trace[i]);
+			say_num("conprobe:        asked ", trace_req[i]);
+			say_num("conprobe:        gave  ", trace_got[i]);
+		}
+		if (trace_n == 0)
+			say("conprobe:   (none)\n");
+	}
 
 	if (st.packets > 0 && io.script_pos > 0)
 	{
