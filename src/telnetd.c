@@ -256,6 +256,7 @@ static void run_session(LONG sock)
 	long                ndef = 0;
 	struct TagItem      proctags[6];
 	int                 helper_done = 0;
+	int                 idle_ticks = 0;
 	LONG                yes = 1;
 
 	s = AllocVec(sizeof(struct Session), MEMF_PUBLIC | MEMF_CLEAR);
@@ -312,7 +313,8 @@ static void run_session(LONG sock)
 		goto cleanup_mounted;
 	}
 
-	say("telnetd: session started\n");
+	say("telnetd: mounted " MOUNT_NAME ": and started helper\n");
+	say("telnetd: shell command = " SHELL_COMMAND "\n");
 
 	while (!helper_done || !console_session_finished(&s->con))
 	{
@@ -400,6 +402,8 @@ static void run_session(LONG sock)
 				len    = pkt->dp_Arg3;
 			}
 
+			say_num("telnetd: packet dp_Type = ", pkt->dp_Type);
+
 			r = console_dispatch(&s->con, pkt->dp_Type, pkt->dp_Arg1,
 			                     pkt->dp_Arg2, bufarg, len);
 
@@ -434,9 +438,18 @@ static void run_session(LONG sock)
 		}
 
 		while (GetMsg(replyport) != NULL)
+		{
 			helper_done = 1;
+			/* The helper's exit code is the single most useful fact
+			 * when nothing else happens: a shell that never started
+			 * and a shell that started and left look identical from
+			 * the packet side, which is silence either way. */
+			say_num("telnetd: helper finished, SystemTagList rc = ", sm->rc);
+		}
 
 		/* Nothing happened at all for a whole timeout: wind it down. */
+		say_num("telnetd: loop tick, packets so far = ", s->con.packets);
+
 		if (s->con.packets == before && !(sigs & SIGBREAKF_CTRL_C))
 		{
 			if (s->con.draining)
