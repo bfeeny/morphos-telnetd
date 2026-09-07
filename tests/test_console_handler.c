@@ -96,11 +96,11 @@ static void test_read_delivers_input(void)
 	setup(&st, &io, "version\n");
 
 	memset(buf, 0, sizeof(buf));
-	r = console_dispatch(&st, ACTION_READ, 1, buf, (long)sizeof(buf));
+	r = console_dispatch(&st, ACTION_READ, 1, 0, buf, (long)sizeof(buf));
 	CHECK(r.res1 == 8, "read returns the byte count");
 	CHECK(memcmp(buf, "version\n", 8) == 0, "read delivers the right bytes");
 
-	r = console_dispatch(&st, ACTION_READ, 1, buf, (long)sizeof(buf));
+	r = console_dispatch(&st, ACTION_READ, 1, 0, buf, (long)sizeof(buf));
 	CHECK(r.res1 == 0, "read reports EOF once input is exhausted");
 }
 
@@ -114,13 +114,13 @@ static void test_read_rejects_bad_arguments(void)
 	printf("read refuses malformed packets instead of writing wild\n");
 	setup(&st, &io, "abc");
 
-	r = console_dispatch(&st, ACTION_READ, 1, NULL, 16);
+	r = console_dispatch(&st, ACTION_READ, 1, 0, NULL, 16);
 	CHECK(r.res1 == 0, "NULL buffer yields 0, not a crash");
 
-	r = console_dispatch(&st, ACTION_READ, 1, buf, 0);
+	r = console_dispatch(&st, ACTION_READ, 1, 0, buf, 0);
 	CHECK(r.res1 == 0, "zero length yields 0");
 
-	r = console_dispatch(&st, ACTION_READ, 1, buf, -4096);
+	r = console_dispatch(&st, ACTION_READ, 1, 0, buf, -4096);
 	CHECK(r.res1 == 0, "negative length yields 0");
 }
 
@@ -135,7 +135,7 @@ static void test_read_never_exceeds_the_buffer(void)
 	setup(&st, &io, "plenty of input here");
 	io.force_read_return = 9999;	/* callback claims far too much */
 
-	r = console_dispatch(&st, ACTION_READ, 1, buf, (long)sizeof(buf));
+	r = console_dispatch(&st, ACTION_READ, 1, 0, buf, (long)sizeof(buf));
 	CHECK(r.res1 == (long)sizeof(buf), "result is clamped to the buffer size");
 	CHECK(st.inconsistent == 1, "and the state is marked inconsistent");
 }
@@ -149,12 +149,12 @@ static void test_write_forwards_output(void)
 	printf("write forwards the shell's output\n");
 	setup(&st, &io, "");
 
-	r = console_dispatch(&st, ACTION_WRITE, 2, (void *)"hello", 5);
+	r = console_dispatch(&st, ACTION_WRITE, 2, 0, (void *)"hello", 5);
 	CHECK(r.res1 == 5, "write returns the length");
 	CHECK(io.out_len == 5 && memcmp(io.out, "hello", 5) == 0,
 	      "the bytes reach the sink");
 
-	r = console_dispatch(&st, ACTION_WRITE, 2, NULL, 5);
+	r = console_dispatch(&st, ACTION_WRITE, 2, 0, NULL, 5);
 	CHECK(r.res1 == 0, "NULL buffer yields 0");
 }
 
@@ -167,11 +167,11 @@ static void test_screen_mode_records_line_discipline(void)
 	printf("SCREEN_MODE is recorded (raw vs cooked)\n");
 	setup(&st, &io, "");
 
-	r = console_dispatch(&st, ACTION_SCREEN_MODE, DOSTRUE, NULL, 0);
+	r = console_dispatch(&st, ACTION_SCREEN_MODE, DOSTRUE, 0, NULL, 0);
 	CHECK(r.res1 == DOSTRUE, "accepted");
 	CHECK(st.raw_mode == 1, "raw mode recorded");
 
-	console_dispatch(&st, ACTION_SCREEN_MODE, DOSFALSE, NULL, 0);
+	console_dispatch(&st, ACTION_SCREEN_MODE, DOSFALSE, 0, NULL, 0);
 	CHECK(st.raw_mode == 0, "cooked mode recorded");
 }
 
@@ -184,7 +184,7 @@ static void test_unknown_packets_are_refused_politely(void)
 	printf("unknown packets are refused, not ignored\n");
 	setup(&st, &io, "");
 
-	r = console_dispatch(&st, 31337, 0, NULL, 0);
+	r = console_dispatch(&st, 31337, 0, 0, NULL, 0);
 	CHECK(r.res1 == DOSFALSE, "refused");
 	CHECK(r.res2 == ERROR_ACTION_NOT_KNOWN, "with the documented error");
 	CHECK(st.unknown == 1, "and counted, so the probe can report it");
@@ -200,14 +200,14 @@ static void test_change_signal_is_accepted_and_recorded(void)
 	printf("CHANGE_SIGNAL is accepted, and the task is kept\n");
 	setup(&st, &io, "");
 
-	r = console_dispatch(&st, ACTION_CHANGE_SIGNAL, fake_task, NULL, 0);
+	r = console_dispatch(&st, ACTION_CHANGE_SIGNAL, 1, fake_task, NULL, 0);
 	CHECK(r.res1 == DOSTRUE, "accepted, not refused as unknown");
 	CHECK(st.unknown == 0, "not counted as unknown");
-	CHECK(st.signal_task == (void *)fake_task, "task recorded -- this is the ^C target");
+	CHECK(st.signal_task == (void *)fake_task, "dp_Arg2 recorded -- this is the ^C target");
 	CHECK(st.signals_seen == 1, "counted");
 
 	/* A zero task must not wipe a good one. */
-	console_dispatch(&st, ACTION_CHANGE_SIGNAL, 0, NULL, 0);
+	console_dispatch(&st, ACTION_CHANGE_SIGNAL, 1, 0, NULL, 0);
 	CHECK(st.signal_task == (void *)fake_task, "a null task does not clear it");
 }
 
@@ -223,10 +223,10 @@ static void test_session_not_finished_while_handles_are_open(void)
 
 	CHECK(!console_session_finished(&st), "two handles outstanding: not finished");
 
-	console_dispatch(&st, ACTION_END, 1, NULL, 0);
+	console_dispatch(&st, ACTION_END, 1, 0, NULL, 0);
 	CHECK(!console_session_finished(&st), "one handle outstanding: not finished");
 
-	console_dispatch(&st, ACTION_END, 2, NULL, 0);
+	console_dispatch(&st, ACTION_END, 2, 0, NULL, 0);
 	CHECK(console_session_finished(&st), "all closed: finished");
 }
 
@@ -239,15 +239,15 @@ static void test_opens_are_counted_so_we_do_not_finish_early(void)
 	setup(&st, &io, "");
 
 	/* The Shell opens "*" -- e.g. a program asking for the console. */
-	console_dispatch(&st, ACTION_FINDINPUT, 0, NULL, 0);
+	console_dispatch(&st, ACTION_FINDINPUT, 0, 0, NULL, 0);
 	CHECK(st.open_handles == 3, "three handles now outstanding");
 
-	console_dispatch(&st, ACTION_END, 0, NULL, 0);
-	console_dispatch(&st, ACTION_END, 0, NULL, 0);
+	console_dispatch(&st, ACTION_END, 0, 0, NULL, 0);
+	console_dispatch(&st, ACTION_END, 0, 0, NULL, 0);
 	CHECK(!console_session_finished(&st),
 	      "still one open: must not declare the session over");
 
-	console_dispatch(&st, ACTION_END, 0, NULL, 0);
+	console_dispatch(&st, ACTION_END, 0, 0, NULL, 0);
 	CHECK(console_session_finished(&st), "now it is over");
 }
 
@@ -259,9 +259,9 @@ static void test_unbalanced_close_poisons_the_accounting(void)
 	printf("more closes than opens is treated as loss of tracking\n");
 	setup(&st, &io, "");
 
-	console_dispatch(&st, ACTION_END, 0, NULL, 0);
-	console_dispatch(&st, ACTION_END, 0, NULL, 0);
-	console_dispatch(&st, ACTION_END, 0, NULL, 0);	/* one too many */
+	console_dispatch(&st, ACTION_END, 0, 0, NULL, 0);
+	console_dispatch(&st, ACTION_END, 0, 0, NULL, 0);
+	console_dispatch(&st, ACTION_END, 0, 0, NULL, 0);	/* one too many */
 
 	CHECK(st.inconsistent == 1, "flagged inconsistent");
 	CHECK(!console_session_finished(&st),
@@ -278,8 +278,8 @@ static void test_port_is_never_declared_safe_to_free(void)
 
 	CHECK(!console_safe_to_free_port(&st), "not at the start");
 
-	console_dispatch(&st, ACTION_END, 0, NULL, 0);
-	console_dispatch(&st, ACTION_END, 0, NULL, 0);
+	console_dispatch(&st, ACTION_END, 0, 0, NULL, 0);
+	console_dispatch(&st, ACTION_END, 0, 0, NULL, 0);
 	CHECK(console_session_finished(&st), "session is finished...");
 	CHECK(!console_safe_to_free_port(&st),
 	      "...and the port is STILL not safe to free");
@@ -300,10 +300,10 @@ static void test_draining_makes_the_shell_exit(void)
 
 	console_begin_drain(&st);
 
-	r = console_dispatch(&st, ACTION_READ, 1, buf, (long)sizeof(buf));
+	r = console_dispatch(&st, ACTION_READ, 1, 0, buf, (long)sizeof(buf));
 	CHECK(r.res1 == 0, "read reports EOF even though input remains");
 
-	r = console_dispatch(&st, ACTION_WAIT_CHAR, 1000000, NULL, 0);
+	r = console_dispatch(&st, ACTION_WAIT_CHAR, 1000000, 0, NULL, 0);
 	CHECK(r.res1 == DOSTRUE,
 	      "WAIT_CHAR still says readable, or the shell would block forever");
 }
@@ -321,9 +321,138 @@ static void test_packet_cap_triggers_drain(void)
 	console_init(&st, fake_read, fake_write, &io, 2, 5);
 
 	for (i = 0; i < 10; i++)
-		console_dispatch(&st, ACTION_WAIT_CHAR, 0, buf, 0);
+		console_dispatch(&st, ACTION_WAIT_CHAR, 0, 0, buf, 0);
 
 	CHECK(st.draining == 1, "draining after exceeding the cap");
+}
+
+/* ---- window size: the NAWS delivery path ------------------------------- */
+
+/* ixemul sends CSI SP q and sscanf's back "1;1;%d;%d r". Source:
+ * ixemul.library/library/__tioctl.c:280-312. */
+static const char CSI_SP_Q[3] = { (char)0x9B, ' ', 'q' };
+
+static long drain_reply(struct ConsoleState *st, char *out, long max)
+{
+	struct ConsoleReply r = console_dispatch(st, ACTION_READ, 1, 0, out, max);
+	return r.res1;
+}
+
+static void test_size_report_exact_bytes(void)
+{
+	struct ConsoleState st;
+	struct FakeIO io;
+	char got[64];
+	long n;
+
+	printf("CSI SP q is answered with the exact bytes ixemul parses\n");
+	setup(&st, &io, "");
+	console_set_window_size(&st, 40, 120);	/* rows, cols */
+
+	console_dispatch(&st, ACTION_WRITE, 2, 0, (void *)CSI_SP_Q, 3);
+	CHECK(st.size_requests == 1, "the request was recognised");
+	CHECK(io.out_len == 0, "and swallowed -- it must not reach the network");
+
+	memset(got, 0, sizeof(got));
+	n = drain_reply(&st, got, (long)sizeof(got));
+
+	CHECK(n == 13, "reply length");
+	CHECK((unsigned char)got[0] == 0x9B, "single-byte CSI, not ESC-[");
+	CHECK(memcmp(got + 1, "1;1;40;120 r", 12) == 0,
+	      "1;1; prefix, ROWS then COLS, space before r");
+}
+
+static void test_size_report_is_split_safe(void)
+{
+	struct ConsoleState st;
+	struct FakeIO io;
+	char got[64];
+
+	printf("the request is recognised when split across three writes\n");
+	setup(&st, &io, "");
+	console_set_window_size(&st, 24, 80);
+
+	console_dispatch(&st, ACTION_WRITE, 2, 0, (void *)&CSI_SP_Q[0], 1);
+	console_dispatch(&st, ACTION_WRITE, 2, 0, (void *)&CSI_SP_Q[1], 1);
+	console_dispatch(&st, ACTION_WRITE, 2, 0, (void *)&CSI_SP_Q[2], 1);
+
+	CHECK(st.size_requests == 1, "recognised across write boundaries");
+	CHECK(io.out_len == 0, "nothing leaked to the network");
+
+	memset(got, 0, sizeof(got));
+	drain_reply(&st, got, (long)sizeof(got));
+	CHECK(memcmp(got + 1, "1;1;24;80 r", 11) == 0, "answered correctly");
+}
+
+static void test_partial_match_is_not_swallowed(void)
+{
+	struct ConsoleState st;
+	struct FakeIO io;
+	const unsigned char text[] = { 0x9B, ' ', 'H', 'i' };
+
+	printf("a CSI that is not a size request still reaches the network\n");
+	setup(&st, &io, "");
+
+	console_dispatch(&st, ACTION_WRITE, 2, 0, (void *)text, 4);
+	CHECK(st.size_requests == 0, "not treated as a request");
+	CHECK(io.out_len == 4, "all four bytes forwarded");
+	CHECK((unsigned char)io.out[0] == 0x9B && io.out[1] == ' '
+	      && io.out[2] == 'H' && io.out[3] == 'i', "in the right order");
+}
+
+static void test_size_answered_from_current_value(void)
+{
+	struct ConsoleState st;
+	struct FakeIO io;
+	char got[64];
+
+	printf("the answer uses the size at ASK time, not at connect time\n");
+	setup(&st, &io, "");
+	console_set_window_size(&st, 24, 80);
+	console_set_window_size(&st, 50, 200);	/* NAWS resend after a resize */
+
+	console_dispatch(&st, ACTION_WRITE, 2, 0, (void *)CSI_SP_Q, 3);
+	memset(got, 0, sizeof(got));
+	drain_reply(&st, got, (long)sizeof(got));
+
+	CHECK(memcmp(got + 1, "1;1;50;200 r", 12) == 0, "the newer size wins");
+}
+
+static void test_unknown_size_reports_nothing(void)
+{
+	struct ConsoleState st;
+	struct FakeIO io;
+	char got[64];
+
+	printf("with no NAWS yet, we stay silent rather than invent a size\n");
+	setup(&st, &io, "");
+
+	console_dispatch(&st, ACTION_WRITE, 2, 0, (void *)CSI_SP_Q, 3);
+	CHECK(st.size_requests == 1, "request still counted");
+	CHECK(drain_reply(&st, got, (long)sizeof(got)) == 0, "nothing queued");
+}
+
+static void test_size_reply_outranks_normal_input(void)
+{
+	struct ConsoleState st;
+	struct FakeIO io;
+	char got[64];
+	long n;
+
+	printf("a queued reply is delivered before ordinary typed input\n");
+	setup(&st, &io, "hello\n");
+	console_set_window_size(&st, 25, 80);
+
+	console_dispatch(&st, ACTION_WRITE, 2, 0, (void *)CSI_SP_Q, 3);
+
+	memset(got, 0, sizeof(got));
+	n = drain_reply(&st, got, (long)sizeof(got));
+	CHECK((unsigned char)got[0] == 0x9B, "reply comes first");
+
+	memset(got, 0, sizeof(got));
+	n = drain_reply(&st, got, (long)sizeof(got));
+	CHECK(n == 6 && memcmp(got, "hello\n", 6) == 0,
+	      "then the real input, undisturbed");
 }
 
 /* ---- main -------------------------------------------------------------- */
@@ -345,6 +474,12 @@ int main(void)
 	test_port_is_never_declared_safe_to_free();
 	test_draining_makes_the_shell_exit();
 	test_packet_cap_triggers_drain();
+	test_size_report_exact_bytes();
+	test_size_report_is_split_safe();
+	test_partial_match_is_not_swallowed();
+	test_size_answered_from_current_value();
+	test_unknown_size_reports_nothing();
+	test_size_reply_outranks_normal_input();
 
 	printf("\n%d checks, %d failures\n", checks, failures);
 	return failures == 0 ? 0 : 1;

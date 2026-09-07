@@ -88,9 +88,47 @@ struct ConsoleState
 	 * the Shell through SystemTagList() and never get a Process pointer back,
 	 * so this packet is the only route to the identity we need in order to
 	 * turn telnet's Interrupt Process into SIGBREAKF_CTRL_C.
+	 *
+	 * Measured on MorphOS 3.20 rather than inferred: the packet carries
+	 * three arguments, and it is dp_Arg2 that holds the task --
+	 *
+	 *   dp_Arg1 = 1            (constant across sessions)
+	 *   dp_Arg2 = 566435964, then 654606452 on the next session
+	 *   dp_Arg3 = 0
+	 *   our own task = 631194168
+	 *
+	 * dp_Arg2 changes per client and sits in the same region as a known
+	 * task pointer; dp_Arg1 does not vary at all. Reading dp_Arg1 as the
+	 * task -- which this code did at first -- would have signalled 1.
 	 */
 	void *signal_task;
 	long  signals_seen;
+
+	/*
+	 * Window size, and the machinery for reporting it.
+	 *
+	 * MorphOS has NO resize notification -- there is no packet for it among
+	 * the 82 ACTION_* constants. So a program cannot be told the size has
+	 * changed; it can only ask, and we must answer from whatever NAWS last
+	 * told us AT THE MOMENT IT ASKS. Never from a value cached at connect.
+	 *
+	 * The Amiga-native query is CSI SP q (9B 20 71) -- CSI is the single
+	 * byte 0x9B, not ESC-[. ixemul's TIOCGWINSZ sends exactly that and
+	 * parses back "1;1;<rows>;<cols> r" (note the space before 'r').
+	 * Source: ixemul.library/library/__tioctl.c:280-312.
+	 *
+	 * The program writes that request to its console -- i.e. to us -- so we
+	 * detect it in the outgoing stream, swallow it, and queue the answer
+	 * where the next read will find it.
+	 */
+	long rows, cols;	/* 0 == unknown, report nothing */
+
+	unsigned char pending[48];	/* queued reply awaiting an ACTION_READ */
+	long          pending_len;
+	long          pending_pos;
+
+	int  q_state;	/* incremental match of CSI SP q across writes */
+	long size_requests;
 
 	int  raw_mode;	/* last ACTION_SCREEN_MODE: 1 raw, 0 cooked */
 	int  draining;	/* wind down: reads return EOF so the Shell exits */
@@ -117,12 +155,19 @@ void console_init(struct ConsoleState *st,
 struct ConsoleReply console_dispatch(struct ConsoleState *st,
                                      long type,
                                      long arg1,
+                                     long arg2,
                                      void *bufarg,
                                      long len);
 
 /* Ask for a wind-down: subsequent reads report EOF, so the Shell exits of
  * its own accord rather than having its handles pulled out from under it. */
 void console_begin_drain(struct ConsoleState *st);
+
+/*
+ * Tell the handler the terminal's current size, as NAWS reports it.
+ * Safe to call at any time and as often as the client resends.
+ */
+void console_set_window_size(struct ConsoleState *st, long rows, long cols);
 
 /*
  * Is the session finished -- may the caller stop servicing packets?

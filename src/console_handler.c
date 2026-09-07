@@ -26,6 +26,12 @@ void console_init(struct ConsoleState *st,
 	st->unknown      = 0;
 	st->signal_task  = 0;
 	st->signals_seen = 0;
+	st->rows         = 0;
+	st->cols         = 0;
+	st->pending_len  = 0;
+	st->pending_pos  = 0;
+	st->q_state      = 0;
+	st->size_requests = 0;
 	st->raw_mode     = 0;
 	st->draining     = 0;
 	st->inconsistent = (initial_handles < 0) ? 1 : 0;
@@ -55,6 +61,132 @@ int console_safe_to_free_port(const struct ConsoleState *st)
 	return 0;
 }
 
+void console_set_window_size(struct ConsoleState *st, long rows, long cols)
+{
+	if (rows > 0) st->rows = rows;
+	if (cols > 0) st->cols = cols;
+}
+
+/* Append a decimal number to the pending reply. */
+static void pend_num(struct ConsoleState *st, long v)
+{
+	unsigned char tmp[12];
+	int i = 0;
+
+	if (v <= 0) v = 0;
+	do { tmp[i++] = (unsigned char)('0' + (v % 10)); v /= 10; } while (v > 0 && i < 12);
+	while (i > 0 && st->pending_len < (long)sizeof(st->pending))
+		st->pending[st->pending_len++] = tmp[--i];
+}
+
+static void pend_byte(struct ConsoleState *st, unsigned char c)
+{
+	if (st->pending_len < (long)sizeof(st->pending))
+		st->pending[st->pending_len++] = c;
+}
+
+/*
+ * Queue the answer to CSI SP q:  CSI 1;1;<rows>;<cols> SP r
+ *
+ * "1;1;" is a literal prefix -- the top-left of the reported bounds -- and
+ * only the last two numbers vary. Rows first. The space before 'r' is part of
+ * the format ixemul's sscanf expects; without it the parse fails.
+ */
+static void queue_size_report(struct ConsoleState *st)
+{
+	st->size_requests++;
+
+	if (st->rows <= 0 || st->cols <= 0)
+		return;	/* size unknown: say nothing rather than lie */
+
+	/* Drop anything unread rather than interleave two reports. */
+	st->pending_len = 0;
+	st->pending_pos = 0;
+
+	pend_byte(st, 0x9B);
+	pend_byte(st, '1'); pend_byte(st, ';');
+	pend_byte(st, '1'); pend_byte(st, ';');
+	pend_num(st, st->rows);
+	pend_byte(st, ';');
+	pend_num(st, st->cols);
+	pend_byte(st, ' ');
+	pend_byte(st, 'r');
+}
+
+/*
+ * Forward outgoing bytes, swallowing any CSI SP q request and queueing its
+ * reply.
+ *
+ * This does NOT modify the caller's buffer. On an ACTION_WRITE that buffer
+ * belongs to the Shell and may live in read-only memory -- compacting it in
+ * place cost a bus error the first time, caught on the build host rather than
+ * on a machine with no memory protection.
+ *
+ * Instead the buffer is forwarded in runs, skipping the request bytes. Held-back
+ * bytes from a partial match are emitted from a literal, since we know exactly
+ * what they were.
+ *
+ * Incremental on purpose: the three bytes can arrive in three separate writes.
+ * A scanner that only inspects whole buffers will eventually miss one -- the
+ * same mistake busybox's telnetd makes with split IAC sequences.
+ */
+static const unsigned char CSI_SP[2] = { 0x9B, ' ' };
+
+static long emit(struct ConsoleState *st, const unsigned char *p, long n)
+{
+	if (n <= 0)
+		return 0;
+	if (st->write_fn == NULL)
+		return n;
+	return st->write_fn(st->io_ctx, p, n);
+}
+
+static void forward_filtered(struct ConsoleState *st,
+                             const unsigned char *buf, long len)
+{
+	long i, run = 0;
+
+	for (i = 0; i < len; i++)
+	{
+		unsigned char c = buf[i];
+
+		if (st->q_state == 0)
+		{
+			if (c == 0x9B)
+			{
+				emit(st, buf + run, i - run);	/* flush text so far */
+				st->q_state = 1;
+				run = i + 1;
+			}
+			continue;
+		}
+
+		if (st->q_state == 1)
+		{
+			if (c == ' ') { st->q_state = 2; run = i + 1; continue; }
+			emit(st, CSI_SP, 1);	/* the CSI we held back */
+			st->q_state = (c == 0x9B) ? 1 : 0;
+			run = (c == 0x9B) ? i + 1 : i;
+			continue;
+		}
+
+		/* q_state == 2 */
+		if (c == 'q')
+		{
+			queue_size_report(st);
+			st->q_state = 0;
+			run = i + 1;
+			continue;
+		}
+		emit(st, CSI_SP, 2);	/* CSI and space, neither of them ours */
+		st->q_state = (c == 0x9B) ? 1 : 0;
+		run = (c == 0x9B) ? i + 1 : i;
+	}
+
+	if (st->q_state == 0)
+		emit(st, buf + run, len - run);
+}
+
 static long do_read(struct ConsoleState *st, void *buf, long len)
 {
 	long n;
@@ -63,6 +195,25 @@ static long do_read(struct ConsoleState *st, void *buf, long len)
 	 * become a wild write. */
 	if (buf == NULL || len <= 0)
 		return 0;
+
+	/* A queued size report outranks ordinary input: the program that asked
+	 * is blocked waiting for it. */
+	if (st->pending_pos < st->pending_len)
+	{
+		long avail = st->pending_len - st->pending_pos;
+		unsigned char *dst = (unsigned char *)buf;
+
+		n = (len < avail) ? len : avail;
+		for (avail = 0; avail < n; avail++)
+			dst[avail] = st->pending[st->pending_pos++];
+
+		if (st->pending_pos >= st->pending_len)
+		{
+			st->pending_len = 0;
+			st->pending_pos = 0;
+		}
+		return n;
+	}
 
 	if (st->draining)
 		return 0;	/* EOF -- the Shell exits on its own */
@@ -86,30 +237,21 @@ static long do_read(struct ConsoleState *st, void *buf, long len)
 
 static long do_write(struct ConsoleState *st, const void *buf, long len)
 {
-	long n;
-
 	if (buf == NULL || len <= 0)
 		return 0;
 
-	if (st->write_fn == NULL)
-		return len;	/* discard, but tell the Shell it succeeded */
+	forward_filtered(st, (const unsigned char *)buf, len);
 
-	n = st->write_fn(st->io_ctx, buf, len);
-
-	if (n < 0)
-		n = 0;
-	if (n > len)
-	{
-		n = len;
-		st->inconsistent = 1;
-	}
-
-	return n;
+	/* Always report the full count. We consumed everything the Shell gave
+	 * us, including any request we swallowed; a short count reads as an
+	 * error to the caller. */
+	return len;
 }
 
 struct ConsoleReply console_dispatch(struct ConsoleState *st,
                                      long type,
                                      long arg1,
+                                     long arg2,
                                      void *bufarg,
                                      long len)
 {
@@ -181,8 +323,8 @@ struct ConsoleReply console_dispatch(struct ConsoleState *st,
 		 * Observed on MorphOS 3.20 as the very first packet of a
 		 * session and again at teardown.
 		 */
-		if (arg1 != 0)
-			st->signal_task = (void *)arg1;
+		if (arg2 != 0)
+			st->signal_task = (void *)arg2;
 		st->signals_seen++;
 		r.res1 = DOSTRUE;
 		break;

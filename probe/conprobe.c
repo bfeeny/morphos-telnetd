@@ -669,7 +669,26 @@ int main(int argc, char **argv)
 				len    = pkt->dp_Arg3;
 			}
 
-			reply = console_dispatch(&st, pkt->dp_Type, pkt->dp_Arg1,
+			/*
+			 * ACTION_CHANGE_SIGNAL takes three arguments and returns two
+			 * values even on success (Snoopium's own packet table). Which
+			 * argument carries the task and which the signal is not
+			 * documented anywhere -- the packet layer is absent from the
+			 * source release. We are the console handler receiving it, so
+			 * we can simply read all three and settle it by measurement
+			 * rather than inference.
+			 */
+			if (pkt->dp_Type == ACTION_CHANGE_SIGNAL)
+			{
+				say("\n[CHANGE_SIGNAL] three args:\n");
+				say_num("  dp_Arg1 = ", pkt->dp_Arg1);
+				say_num("  dp_Arg2 = ", pkt->dp_Arg2);
+				say_num("  dp_Arg3 = ", pkt->dp_Arg3);
+				say_num("  our own task = ", (LONG)FindTask(NULL));
+			}
+
+			reply = console_dispatch(&st, pkt->dp_Type,
+			                         pkt->dp_Arg1, pkt->dp_Arg2,
 			                         bufarg, len);
 			trace_add(pkt->dp_Type,
 			          (pkt->dp_Type == ACTION_READ || pkt->dp_Type == ACTION_WRITE)
