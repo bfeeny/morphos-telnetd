@@ -459,6 +459,18 @@ static void run_session(LONG sock, LONG session_no)
 		goto cleanup_early;
 	}
 
+	/*
+	 * The telnet layer must exist BEFORE authentication: the login dialogue
+	 * is carried over it, and until telnet_init() runs, out_fn is NULL and
+	 * every prompt goes nowhere. That ordering bug was invisible while the
+	 * development bypass was in use, because the bypass returns before any
+	 * prompt is written -- the working path could not exercise the broken
+	 * one. With auth enabled the client would simply have sat there.
+	 */
+	telnet_init(&s->tn, net_out, net_size, s);
+	console_init(&s->con, shell_read, shell_write, s, 2, 0);
+	telnet_start(&s->tn);
+
 	/* Authenticate BEFORE anything else exists. A failed login must not have
 	 * caused a device to be mounted or a Shell to be spawned. */
 	if (!authenticate(s))
@@ -477,9 +489,6 @@ static void run_session(LONG sock, LONG session_no)
 		goto cleanup_early;
 	}
 
-	telnet_init(&s->tn, net_out, net_size, s);
-	console_init(&s->con, shell_read, shell_write, s, 2, 0);
-	telnet_start(&s->tn);
 
 	sm->msg.mn_Node.ln_Type = NT_MESSAGE;
 	sm->msg.mn_ReplyPort    = replyport;
