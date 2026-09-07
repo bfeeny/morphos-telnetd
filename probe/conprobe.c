@@ -408,7 +408,7 @@ int main(int argc, char **argv)
 	struct FileHandle   *fh_in     = NULL;
 	struct FileHandle   *fh_out    = NULL;
 	struct Process      *helper;
-	struct TagItem       proctags[6];
+	struct TagItem       proctags[7];
 	int                  helper_done = 0;
 	int                  status = RETURN_FAIL;
 
@@ -463,7 +463,47 @@ int main(int argc, char **argv)
 	 * actually consume a script from our handle?). Being able to switch
 	 * without a rebuild is the difference between one round trip and three.
 	 */
-	if (argc > 1 && argv[1] && argv[1][0] == '-' && argv[1][1] == 'l')
+	/*
+	 * Canned commands rather than free text. There are three shells between
+	 * the build host and this program -- bash, the agent's pdksh, and
+	 * AmigaDOS -- and "NewShell *" arrived here as 'NewShell "', which
+	 * NewShell rejected with rc=10. Anything containing a quote or a star
+	 * cannot survive that trip intact, so the interesting commands are
+	 * spelled here where no shell can touch them.
+	 */
+	if (argc > 1 && argv[1] && argv[1][0] == '-' && argv[1][1] == 'c')
+	{
+		/*
+		 * CONSOLE: is the name that resolves through pr_ConsoleTask --
+		 * i.e. to us. The SystemTagList autodoc says as much when it
+		 * describes the shell "opening CONSOLE: on that handler".
+		 * "NewShell *" is rejected here as an invalid window description.
+		 */
+		sm->command = (CONST_STRPTR)"NewShell CONSOLE:";
+		say("conprobe: mode = NewShell CONSOLE: (resolves via pr_ConsoleTask)\n");
+	}
+	else if (argc > 1 && argv[1] && argv[1][0] == '-' && argv[1][1] == 'o')
+	{
+		/*
+		 * The arrangement the autodoc actually recommends for a console:
+		 * give SYS_Input only, leave SYS_Output NULL, and let the shell
+		 * open CONSOLE: on our handler for its output.
+		 */
+		sm->command   = NULL;
+		sm->output    = 0;
+		say("conprobe: mode = interactive, SYS_Output NULL (shell opens CONSOLE:)\n");
+	}
+	else if (argc > 1 && argv[1] && argv[1][0] == '-' && argv[1][1] == 'n')
+	{
+		sm->command = (CONST_STRPTR)"NewShell *";
+		say("conprobe: mode = NewShell on our console (as telnetd 2.0 does)\n");
+	}
+	else if (argc > 1 && argv[1] && argv[1][0] == '-' && argv[1][1] == 's')
+	{
+		sm->command = (CONST_STRPTR)"C:Shell";
+		say("conprobe: mode = C:Shell on our console\n");
+	}
+	else if (argc > 1 && argv[1] && argv[1][0] == '-' && argv[1][1] == 'l')
 	{
 		io.line_mode = 1;
 		sm->command  = NULL;
@@ -481,14 +521,28 @@ int main(int argc, char **argv)
 		say("conprobe: mode = interactive, reads answered in full\n");
 	}
 
-	console_init(&st, probe_read, probe_write, &io, 2, MAX_PACKETS);
+	console_init(&st, probe_read, probe_write, &io,
+	             sm->output ? 2 : 1, MAX_PACKETS);
 
 	proctags[0].ti_Tag = NP_CodeType;   proctags[0].ti_Data = CODETYPE_PPC;
 	proctags[1].ti_Tag = NP_Entry;      proctags[1].ti_Data = (IPTR)spawn_helper;
 	proctags[2].ti_Tag = NP_StartupMsg; proctags[2].ti_Data = (IPTR)sm;
 	proctags[3].ti_Tag = NP_Name;       proctags[3].ti_Data = (IPTR)"conprobe helper";
 	proctags[4].ti_Tag = NP_WindowPtr;  proctags[4].ti_Data = (IPTR)-1;
-	proctags[5].ti_Tag = TAG_DONE;      proctags[5].ti_Data = 0;
+	/*
+	 * Give the helper a CLI of its own.
+	 *
+	 * It is created with NP_Entry and so has no CLI structure. Running a
+	 * single command through System() works without one -- `version` printed
+	 * through our handler. But RUN_EXECUTE (a NULL command, "shell, read your
+	 * commands from SYS_Input") consistently reads the whole script and
+	 * produces nothing, which is what a shell that never actually starts
+	 * would look like. NP_Cli here is on CreateNewProc, where it is ours to
+	 * set -- unlike on SystemTagList, which documents it among the tags it
+	 * manages itself.
+	 */
+	proctags[5].ti_Tag = NP_Cli;        proctags[5].ti_Data = (IPTR)TRUE;
+	proctags[6].ti_Tag = TAG_DONE;      proctags[6].ti_Data = 0;
 
 	say("conprobe: starting helper process to call SystemTagList()...\n");
 
@@ -565,7 +619,10 @@ int main(int argc, char **argv)
 
 			reply = console_dispatch(&st, pkt->dp_Type, pkt->dp_Arg1,
 			                         bufarg, len);
-			trace_add(pkt->dp_Type, len, reply.res1);
+			trace_add(pkt->dp_Type,
+			          (pkt->dp_Type == ACTION_READ || pkt->dp_Type == ACTION_WRITE)
+			              ? len : pkt->dp_Arg1,
+			          reply.res1);
 			ReplyPkt(pkt, reply.res1, reply.res2);
 		}
 
@@ -594,7 +651,7 @@ int main(int argc, char **argv)
 
 	{
 		LONG i;
-		say("conprobe: packet trace -- type / asked / answered:\n");
+		say("conprobe: packet trace -- type / arg (len for R+W) / answered:\n");
 		for (i = 0; i < trace_n; i++)
 		{
 			say_num("conprobe:   type ", trace[i]);

@@ -108,8 +108,38 @@ message port is the whole event loop. As a bonus this keeps the libnix-only
 - **Untrusted input from the network** on a machine with no process isolation.
   The option-negotiation parser is the classic overflow site — bounds-check it.
 
-## Status
+## Status — confirmed on hardware, with one gap
 
-The shell-attach mechanism is **designed and compiled, not yet observed
-running.** `probe/conprobe.c` exists to confirm it on real hardware before any
-of the daemon is written. See `probe/README.md`.
+**The mechanism works.** Measured on MorphOS 3.20 with `probe/conprobe.c`:
+
+- A Shell spawned with `NP_ConsoleTask` pointing at our port **does** send us
+  its DOS packets.
+- `ACTION_READ` is answered from our buffer and consumed.
+- `ACTION_WRITE` carries the Shell's real output back to us — running `version`
+  through it returns `MorphOS 3.20, Ambient 1.50, Kickstart 51.66`.
+- `ACTION_CHANGE_SIGNAL` arrives as the **first packet of every session**, and
+  carries the identity a `^C` must be delivered to. That answers what had been
+  an open question, since `SystemTagList()` never returns a `Process *`.
+
+**The gap: starting an *interactive* Shell on that console.** Running a single
+command works. Getting a Shell that sits and reads commands from us does not,
+and the reason is now clear:
+
+- `SystemTagList(NULL, ...)` (`RUN_EXECUTE`) reads our entire buffer and
+  produces nothing — no output handle is ever opened.
+- `NewShell` rejects both `*` and `CONSOLE:` with *"invalid window
+  description"*. It wants a name it can `Open()`.
+- There is no `Shell` or `NewShell` **binary**: `MOSSYS:C` has `Execute` but
+  neither of those. They are internal Shell commands, so there is nothing to
+  exec directly.
+
+> [!important] Likely revision: the handler may need a name after all
+> This document previously said `NP_ConsoleTask` needs no `MakeDosEntry` and no
+> mounted device. That is true for **receiving packets**, which is proven. It
+> appears **not** to be true for starting an interactive Shell, because
+> `NewShell` wants a window description — a DOS device name it can open.
+>
+> That points squarely at what `ttyhandler` did in 1996: **mount the handler
+> under a name** (it used `TTY:`) and then start the Shell on it. Our design
+> would become `MakeDosEntry`/`AddDosEntry` a per-session device, then
+> `NewShell <name>:`. Being asked of `morphos-oracle`; not yet confirmed.
