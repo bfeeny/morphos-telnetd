@@ -535,6 +535,7 @@ static void run_session(LONG sock, LONG session_no)
 		struct Message *msg;
 		struct timeval tv;
 		long i;
+		LONG nready;
 		LONG before = s->con.packets;
 
 		FD_ZERO(&rd);
@@ -548,13 +549,13 @@ static void run_session(LONG sock, LONG session_no)
 		 */
 		tv.tv_sec  = SESSION_IDLE_SECS;
 		tv.tv_usec = 0;
-		WaitSelect(s->sock + 1, &rd, NULL, NULL, &tv, (ULONG *)&sigs);
+		nready = WaitSelect(s->sock + 1, &rd, NULL, NULL, &tv, (ULONG *)&sigs);
 
 		if (sigs & SIGBREAKF_CTRL_C)
 			console_begin_drain(&s->con);
 
 		/* --- network -> shell --- */
-		if (s->sock >= 0 && FD_ISSET(s->sock, &rd))
+		if (s->sock >= 0 && nready > 0 && FD_ISSET(s->sock, &rd))
 		{
 			unsigned char raw[1024];
 			LONG got = recv(s->sock, raw, sizeof(raw), 0);
@@ -568,12 +569,18 @@ static void run_session(LONG sock, LONG session_no)
 			}
 			else if (got == 0)
 			{
-				s->peer_gone = 1;	/* clean close */
+				s->peer_gone = 1;	/* orderly close: the peer really has gone */
 			}
-			else
-			{
-				s->peer_gone = 1;	/* error; treat as hangup */
-			}
+			/*
+			 * got < 0 is NOT a hangup.
+			 *
+			 * The socket is non-blocking, so -1 with EWOULDBLOCK simply
+			 * means "nothing right now" -- which happens on any spurious
+			 * readability wake-up. Treating it as a hangup ended sessions
+			 * about two seconds after they started, and looked exactly
+			 * like the client disconnecting. Only recv() == 0, the
+			 * orderly close, means the peer has gone.
+			 */
 		}
 
 		/* --- retry anything we held back --- */
