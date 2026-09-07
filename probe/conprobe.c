@@ -397,6 +397,8 @@ static void watchdog_stop(struct Watchdog *w)
 int main(int argc, char **argv)
 {
 	struct Watchdog      wd;
+	struct DosList      *devnode = NULL;
+	CONST_STRPTR         mount_name = NULL;
 	int                  gave_up = 0;
 	ULONG                deadline = 25;
 	struct ConsoleState  st;
@@ -471,7 +473,38 @@ int main(int argc, char **argv)
 	 * cannot survive that trip intact, so the interesting commands are
 	 * spelled here where no shell can touch them.
 	 */
-	if (argc > 1 && argv[1] && argv[1][0] == '-' && argv[1][1] == 'c')
+	if (argc > 1 && argv[1] && argv[1][0] == '-' && argv[1][1] == 'M')
+	{
+		/* Same mount, but with CON:-style geometry appended. "invalid
+		 * window description" suggests NewShell parses the string for
+		 * x/y/w/h/title rather than treating it as a bare device name. */
+		mount_name  = "TELCON";
+		sm->command = (CONST_STRPTR)"NewShell TELCON:0/0/640/200/Telnet";
+		say("conprobe: mode = mount TELCON: + NewShell with CON-style geometry\n");
+	}
+	else if (argc > 1 && argv[1] && argv[1][0] == '-' && argv[1][1] == 'm')
+	{
+		/*
+		 * Mount ourselves as a named DOS device, then start a Shell on it.
+		 *
+		 * NewShell rejected both "*" and "CONSOLE:" as an invalid window
+		 * description: it wants a name it can Open(). MorphOS's own
+		 * consoles are handlers of exactly this kind -- MOSSYS:L has
+		 * MUICON-Handler and FLOWCON-Handler -- and they are reachable
+		 * because they are mounted under names. Ours had no name, which
+		 * is the whole difference.
+		 *
+		 * MakeDosEntry(DLT_DEVICE) + dol_Task = our port + AddDosEntry()
+		 * registers the name. No handler seglist is involved: we are the
+		 * handler, already running.
+		 *
+		 * This is what ttyhandler did in 1996 with TTY:.
+		 */
+		mount_name = "TELCON";
+		sm->command = (CONST_STRPTR)"NewShell TELCON:";
+		say("conprobe: mode = mount as TELCON: then NewShell on it\n");
+	}
+	else if (argc > 1 && argv[1] && argv[1][0] == '-' && argv[1][1] == 'c')
 	{
 		/*
 		 * CONSOLE: is the name that resolves through pr_ConsoleTask --
@@ -543,6 +576,25 @@ int main(int argc, char **argv)
 	 */
 	proctags[5].ti_Tag = NP_Cli;        proctags[5].ti_Data = (IPTR)TRUE;
 	proctags[6].ti_Tag = TAG_DONE;      proctags[6].ti_Data = 0;
+
+	if (mount_name)
+	{
+		devnode = MakeDosEntry((CONST_STRPTR)mount_name, DLT_DEVICE);
+		if (devnode == NULL)
+		{
+			say("conprobe: FAILED -- MakeDosEntry()\n");
+			goto cleanup_before_helper;
+		}
+		devnode->dol_Task = port;
+		if (!AddDosEntry(devnode))
+		{
+			say("conprobe: FAILED -- AddDosEntry() (name already taken?)\n");
+			FreeDosEntry(devnode);
+			devnode = NULL;
+			goto cleanup_before_helper;
+		}
+		say("conprobe: mounted our port as TELCON:\n");
+	}
 
 	say("conprobe: starting helper process to call SystemTagList()...\n");
 
@@ -706,6 +758,24 @@ int main(int argc, char **argv)
 	 * replyport and sm are ours alone and the helper has exited (we waited
 	 * for its reply), so those are genuinely safe to release.
 	 */
+	if (devnode)
+	{
+		if (!gave_up && console_session_finished(&st))
+		{
+			/* Removing the name cannot strand an open handle: those
+			 * reference the port directly, not the entry. */
+			if (RemDosEntry(devnode))
+			{
+				FreeDosEntry(devnode);
+				say("conprobe: TELCON: unmounted.\n");
+			}
+		}
+		else
+		{
+			say("conprobe: TELCON: left mounted (session did not end cleanly).\n");
+		}
+	}
+
 	if (console_safe_to_free_port(&st))
 		DeleteMsgPort(port);	/* unreachable today, by design */
 	else
