@@ -38,10 +38,27 @@
 
 #include <string.h>
 
+#include <proto/usergroup.h>
+#include <pwd.h>
+
 #include "console_handler.h"
 #include "telnet.h"
+#include "auth.h"
 
 struct Library *SocketBase = NULL;
+struct Library *UserGroupBase = NULL;
+
+/*
+ * Development bypass for authentication.
+ *
+ * OFF by default, and it has to stay that way: the whole point of the policy is
+ * that a MorphOS account with no password refuses remote login, and a bypass
+ * that could be reached by accident would undo it. It exists because the
+ * machine's owner is not always present to type a password, and it announces
+ * itself in the log AND to the connecting client so it can never be running
+ * unnoticed.
+ */
+static int allow_no_auth = 0;
 
 /*
  * FIONBIO, spelled out.
@@ -80,6 +97,7 @@ struct SpawnMsg
 	BPTR  output;
 	APTR  console_port;
 	LONG  rc;
+	char  command_buf[32];
 };
 
 struct Session
@@ -196,6 +214,158 @@ static long shell_write(void *ctx, const void *buf, long len)
 }
 
 /* ------------------------------------------------------------------ */
+/* Authentication                                                       */
+
+static void net_write_str(struct Session *s, CONST_STRPTR text)
+{
+	telnet_output(&s->tn, (const unsigned char *)text, (long)strlen((const char *)text));
+}
+
+/*
+ * Read one line from the client, with a deadline.
+ *
+ * `echo` false is used for the password: we told the client WILL ECHO, so it
+ * sends us characters and expects US to echo them. Simply not echoing is what
+ * hides the password -- there is no separate "turn off echo" needed, because we
+ * were never not in control of it.
+ */
+static int read_line(struct Session *s, char *out, long max, int echo, LONG secs)
+{
+	long n = 0;
+
+	out[0] = '\0';
+
+	for (;;)
+	{
+		fd_set rd;
+		struct timeval tv;
+		LONG sigs = SIGBREAKF_CTRL_C;
+		unsigned char raw[256], clean[256];
+		LONG got, i, cnt;
+
+		FD_ZERO(&rd);
+		FD_SET(s->sock, &rd);
+		tv.tv_sec = secs; tv.tv_usec = 0;
+
+		if (WaitSelect(s->sock + 1, &rd, NULL, NULL, &tv, (ULONG *)&sigs) <= 0)
+			return 0;	/* timed out, or interrupted */
+		if (sigs & SIGBREAKF_CTRL_C)
+			return 0;
+		if (!FD_ISSET(s->sock, &rd))
+			continue;
+
+		got = recv(s->sock, raw, sizeof(raw), 0);
+		if (got <= 0)
+			return 0;	/* hung up mid-login */
+
+		cnt = telnet_input(&s->tn, raw, got, clean, sizeof(clean));
+
+		for (i = 0; i < cnt; i++)
+		{
+			unsigned char c = clean[i];
+
+			if (c == '\r' || c == '\n')
+			{
+				if (n == 0 && c == '\n')
+					continue;	/* bare LF after CR */
+				out[n] = '\0';
+				net_write_str(s, (CONST_STRPTR)"\r\n");
+				return 1;
+			}
+			if (c == 8 || c == 127)		/* backspace / delete */
+			{
+				if (n > 0)
+				{
+					n--;
+					if (echo)
+						net_write_str(s, (CONST_STRPTR)"\b \b");
+				}
+				continue;
+			}
+			if (c < 32 || c > 126)
+				continue;		/* ignore control bytes */
+
+			if (n < max - 1)
+			{
+				out[n++] = (char)c;
+				if (echo)
+					telnet_output(&s->tn, &c, 1);
+			}
+		}
+	}
+}
+
+/*
+ * Authenticate, using the system's own user database.
+ *
+ * The daemon never stores a credential: getpwnam() gives us a salted hash,
+ * ug_GetSalt() gives us its salt, and crypt() turns what was typed into
+ * something comparable. The typed password lives only in a stack buffer, which
+ * is wiped before returning.
+ */
+static int authenticate(struct Session *s)
+{
+	char user[64], pass[128];
+	struct passwd *pw;
+	char salt[64];
+	enum AuthResult res;
+	int i;
+
+	if (allow_no_auth)
+	{
+		say("telnetd: WARNING -- authentication bypassed (-allow-no-auth)\n");
+		net_write_str(s, (CONST_STRPTR)
+			"\r\n*** WARNING: this telnetd is running with authentication DISABLED ***\r\n\r\n");
+		return 1;
+	}
+
+	if (UserGroupBase == NULL)
+	{
+		say("telnetd: usergroup.library unavailable; refusing all logins\n");
+		net_write_str(s, (CONST_STRPTR)"Authentication unavailable.\r\n");
+		return 0;
+	}
+
+	net_write_str(s, (CONST_STRPTR)"\r\nMorphOS telnetd\r\n\r\nlogin: ");
+	if (!read_line(s, user, (long)sizeof(user), 1, 60) || user[0] == '\0')
+		return 0;
+
+	net_write_str(s, (CONST_STRPTR)"password: ");
+	if (!read_line(s, pass, (long)sizeof(pass), 0, 60))
+		return 0;
+
+	pw = getpwnam((STRPTR)user);
+	salt[0] = '\0';
+	if (pw != NULL)
+		ug_GetSalt(pw, (STRPTR)salt, sizeof(salt));
+
+	res = auth_policy(pw ? pw->pw_passwd : NULL,
+	                  (pw && pass[0]) ? (const char *)crypt((STRPTR)pass, (STRPTR)salt)
+	                                  : NULL);
+
+	/* Wipe the typed password as soon as it has been hashed. */
+	for (i = 0; i < (int)sizeof(pass); i++)
+		pass[i] = 0;
+
+	say("telnetd: login '");
+	say((CONST_STRPTR)user);
+	say("' -> ");
+	say((CONST_STRPTR)auth_result_name(res));
+	say("\n");
+
+	if (res != AUTH_OK)
+	{
+		/* One message for every failure: never tell a stranger whether
+		 * the account exists or merely has no password. */
+		net_write_str(s, (CONST_STRPTR)"\r\nLogin incorrect.\r\n");
+		return 0;
+	}
+
+	net_write_str(s, (CONST_STRPTR)"\r\n");
+	return 1;
+}
+
+/* ------------------------------------------------------------------ */
 
 static void spawn_helper(void)
 {
@@ -216,7 +386,7 @@ static void spawn_helper(void)
 	systags[4].ti_Tag = NP_WindowPtr;   systags[4].ti_Data = (IPTR)-1;
 	systags[5].ti_Tag = TAG_DONE;       systags[5].ti_Data = 0;
 
-	sm->rc = SystemTagList((CONST_STRPTR)SHELL_COMMAND, systags);
+	sm->rc = SystemTagList((CONST_STRPTR)sm->command_buf, systags);
 
 	Forbid();
 	if (sm->input)  Close(sm->input);
@@ -245,8 +415,9 @@ static struct FileHandle *make_handle(struct MsgPort *port, LONG mode, LONG id)
 
 /* ------------------------------------------------------------------ */
 
-static void run_session(LONG sock)
+static void run_session(LONG sock, LONG session_no)
 {
+	char mount_name[16];
 	struct Session     *s;
 	struct MsgPort     *port = NULL, *replyport = NULL;
 	struct SpawnMsg    *sm = NULL;
@@ -263,6 +434,19 @@ static void run_session(LONG sock)
 	if (s == NULL) { say("telnetd: out of memory\n"); return; }
 	s->sock = sock;
 
+	/*
+	 * A device name per session. Two sessions cannot share one, and a name
+	 * left behind by a session that died badly must not block the next
+	 * connection -- so they differ rather than collide.
+	 */
+	{
+		LONG v = session_no % 100;
+		mount_name[0] = 'T'; mount_name[1] = 'E'; mount_name[2] = 'L';
+		mount_name[3] = (char)('0' + (v / 10));
+		mount_name[4] = (char)('0' + (v % 10));
+		mount_name[5] = '\0';
+	}
+
 	port      = CreateMsgPort();
 	replyport = CreateMsgPort();
 	sm        = AllocVec(sizeof(struct SpawnMsg), MEMF_PUBLIC | MEMF_CLEAR);
@@ -275,12 +459,20 @@ static void run_session(LONG sock)
 		goto cleanup_early;
 	}
 
-	devnode = MakeDosEntry((CONST_STRPTR)MOUNT_NAME, DLT_DEVICE);
+	/* Authenticate BEFORE anything else exists. A failed login must not have
+	 * caused a device to be mounted or a Shell to be spawned. */
+	if (!authenticate(s))
+	{
+		say("telnetd: login failed; closing\n");
+		goto cleanup_early;
+	}
+
+	devnode = MakeDosEntry((CONST_STRPTR)mount_name, DLT_DEVICE);
 	if (devnode == NULL) { say("telnetd: MakeDosEntry failed\n"); goto cleanup_early; }
 	devnode->dol_Task = port;
 	if (!AddDosEntry(devnode))
 	{
-		say("telnetd: " MOUNT_NAME ": already in use\n");
+		say("telnetd: mount name already in use\n");
 		FreeDosEntry(devnode); devnode = NULL;
 		goto cleanup_early;
 	}
@@ -289,16 +481,24 @@ static void run_session(LONG sock)
 	console_init(&s->con, shell_read, shell_write, s, 2, 0);
 	telnet_start(&s->tn);
 
-	/* Non-blocking: WaitSelect tells us when to read, and a blocking recv
-	 * inside the packet loop would stall the Shell. */
-	IoctlSocket(sock, TD_FIONBIO, (APTR)&yes);
-
 	sm->msg.mn_Node.ln_Type = NT_MESSAGE;
 	sm->msg.mn_ReplyPort    = replyport;
 	sm->msg.mn_Length       = sizeof(struct SpawnMsg);
 	sm->input               = MKBADDR(fh_in);
 	sm->output              = MKBADDR(fh_out);
 	sm->console_port        = (APTR)port;
+
+	/* "NewShell TELnn:" -- built here because the device name varies. */
+	{
+		char *d = sm->command_buf;
+		const char *p1 = "NewShell ";
+		while (*p1) *d++ = *p1++;
+		p1 = mount_name;
+		while (*p1) *d++ = *p1++;
+		*d++ = ':'; *d = '\0';
+	}
+
+	IoctlSocket(s->sock, TD_FIONBIO, (APTR)&yes);
 
 	proctags[0].ti_Tag = NP_CodeType;   proctags[0].ti_Data = CODETYPE_PPC;
 	proctags[1].ti_Tag = NP_Entry;      proctags[1].ti_Data = (IPTR)spawn_helper;
@@ -313,8 +513,9 @@ static void run_session(LONG sock)
 		goto cleanup_mounted;
 	}
 
-	say("telnetd: mounted " MOUNT_NAME ": and started helper\n");
-	say("telnetd: shell command = " SHELL_COMMAND "\n");
+	say("telnetd: session on ");
+	say((CONST_STRPTR)mount_name);
+	say(":\n");
 
 	while (!helper_done || !console_session_finished(&s->con))
 	{
@@ -506,6 +707,7 @@ int main(int argc, char **argv)
 	LONG yes = 1;
 	LONG port_no = DEFAULT_PORT;
 	LONG wait_secs = 0;	/* 0 == wait indefinitely */
+	LONG session_no = 0;
 	CONST_STRPTR bind_addr = NULL;	/* NULL == all interfaces */
 	int i;
 
@@ -526,6 +728,10 @@ int main(int argc, char **argv)
 		{
 			bind_addr = (CONST_STRPTR)argv[++i];
 		}
+		else if (argv[i][0] == '-' && argv[i][1] == 'a')
+		{
+			allow_no_auth = 1;
+		}
 		else if (argv[i][0] == '-' && argv[i][1] == 'l' && i + 1 < argc)
 		{
 			logfh = Open((CONST_STRPTR)argv[++i], MODE_NEWFILE);
@@ -543,6 +749,15 @@ int main(int argc, char **argv)
 	if (SocketBase == NULL)
 	{
 		say("telnetd: cannot open bsdsocket.library\n");
+		return RETURN_FAIL;
+	}
+
+	UserGroupBase = OpenLibrary("usergroup.library", 0);
+	if (UserGroupBase == NULL && !allow_no_auth)
+	{
+		say("telnetd: usergroup.library not available and no bypass given.\n");
+		say("telnetd: refusing to start rather than serve unauthenticated shells.\n");
+		CloseLibrary(SocketBase);
 		return RETURN_FAIL;
 	}
 
@@ -580,7 +795,9 @@ int main(int argc, char **argv)
 	say("telnetd: listening on ");
 	say(bind_addr ? bind_addr : (CONST_STRPTR)"all interfaces");
 	say_num(" port ", port_no);
-	say("telnetd: one session at a time. CTRL-C to stop.\n");
+	say("telnetd: CTRL-C to stop.\n");
+	if (allow_no_auth)
+		say("telnetd: *** AUTHENTICATION DISABLED (-allow-no-auth) ***\n");
 
 	/*
 	 * Wait for a connection WITHOUT calling accept() blindly.
@@ -596,6 +813,7 @@ int main(int argc, char **argv)
 	 * -t bounds the wait. An instrument -- or a daemon -- that cannot be
 	 * stopped is not finished.
 	 */
+	for (;;)
 	{
 		fd_set rd;
 		struct timeval tv;
@@ -612,24 +830,28 @@ int main(int argc, char **argv)
 
 		if (sigs & SIGBREAKF_CTRL_C)
 		{
-			say("telnetd: interrupted before any connection\n");
+			say("telnetd: interrupted; shutting down\n");
+			break;
 		}
 		else if (n > 0 && FD_ISSET(listener, &rd))
 		{
 			conn = accept(listener, NULL, NULL);
 			if (conn >= 0)
-				run_session(conn);
+				run_session(conn, session_no++);
 			else
 				say("telnetd: accept() failed\n");
+			continue;	/* serve the next caller */
 		}
 		else
 		{
 			say("telnetd: no connection within the timeout; exiting\n");
+			break;
 		}
 	}
 
 	CloseSocket(listener);
 	CloseLibrary(SocketBase);
+	if (UserGroupBase) CloseLibrary(UserGroupBase);
 	if (logfh) { say("telnetd: exit\n"); Close(logfh); logfh = 0; }
 	return RETURN_OK;
 }

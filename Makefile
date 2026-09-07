@@ -13,7 +13,7 @@ CFLAGS  = -noixemul -O2 -Wall -Wextra -Wno-unused-parameter \
           -I$(SDK)/gg/os-include
 LDFLAGS =
 
-SRC     = src/telnetd.c src/console_handler.c src/telnet.c
+SRC     = src/telnetd.c src/console_handler.c src/telnet.c src/auth.c
 TARGET  = telnetd
 
 all: $(TARGET)
