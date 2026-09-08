@@ -1029,8 +1029,11 @@ static void session_end(struct Session *s)
 		say("telnetd: no reaper free -- abandoning a console port\n");
 	s->port = NULL;
 
-	if (s->helper_done)
+	if (s->helper_done || !s->shell_started)
 	{
+		/* !shell_started means no helper was ever created, so nothing
+		 * else can be holding these. Leaving them was another signal
+		 * bit gone per refused login. */
 		if (s->replyport) DeleteMsgPort(s->replyport);
 		if (s->sm)        FreeVec(s->sm);
 	}
@@ -1318,14 +1321,6 @@ static void session_service(struct Session *s, int readable, int writable)
 			if (s->phase != PHASE_SHELL)
 				login_consume(s);
 		}
-
-		/* This held the password on its way past. */
-		if (secret)
-		{
-			LONG k;
-			for (k = 0; k < (LONG)sizeof(raw); k++)
-				raw[k] = 0;
-		}
 		else if (got == 0)
 		{
 			s->peer_gone      = 1;
@@ -1352,6 +1347,23 @@ static void session_service(struct Session *s, int readable, int writable)
 				console_begin_drain(&s->con);
 				say_num("telnetd: peer reset; draining, errno = ", e);
 			}
+		}
+
+		/*
+		 * This held the password on its way past.
+		 *
+		 * It goes AFTER the whole chain above, and deliberately: putting
+		 * it in the middle bound the following "else if (got == 0)" to
+		 * this test instead of to the read, so during a login -- when
+		 * `secret` is always true -- a client hanging up was never
+		 * noticed at all. The session then held its slot forever, and
+		 * four callers took the daemon out of service.
+		 */
+		if (secret)
+		{
+			LONG k;
+			for (k = 0; k < (LONG)sizeof(raw); k++)
+				raw[k] = 0;
 		}
 	}
 
