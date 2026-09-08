@@ -135,7 +135,7 @@ struct Session
 	struct SpawnMsg   *sm;
 	struct FileHandle *fh_in, *fh_out;
 	struct DosList    *devnode;
-	char               mount_name[16];
+	char               mount_name[24];
 	int                helper_done;
 
 	/* Reads held because the socket had nothing yet. */
@@ -145,6 +145,13 @@ struct Session
 
 #define MAX_SESSIONS 4
 static struct Session sessions[MAX_SESSIONS];
+
+/* Configuration, parsed once and read by the daemon process. */
+static LONG         cfg_port      = DEFAULT_PORT;
+static LONG         cfg_wait      = 0;
+static CONST_STRPTR cfg_bind      = NULL;
+static CONST_STRPTR cfg_logfile   = NULL;
+
 
 /* ------------------------------------------------------------------ */
 
@@ -531,12 +538,36 @@ static int session_start(struct Session *s, LONG sock, LONG session_no)
 	s->sock   = sock;
 	s->ndef   = 0;
 
+	/*
+	 * A device name unique to this DAEMON as well as this session.
+	 *
+	 * Names used to be TEL00, TEL01... per session, which is fine for one
+	 * daemon and wrong for two: a second instance starts numbering at TEL00
+	 * as well, AddDosEntry fails for whichever asks second, and that
+	 * session dies. Measured -- two daemons on different ports, and only
+	 * the first to ask got a Shell.
+	 *
+	 * That is not a corner case in this design. The whole point of running
+	 * development and production on separate ports is that one can be
+	 * restarted freely while the other serves; a shared name would mean
+	 * iterating on one takes down the other, which is the exact failure the
+	 * split exists to prevent.
+	 *
+	 * The listening port is already unique per daemon, so it goes in the
+	 * name: T<port><letter>, e.g. T2320A.
+	 */
 	{
-		LONG v = session_no % 100;
-		s->mount_name[0] = 'T'; s->mount_name[1] = 'E'; s->mount_name[2] = 'L';
-		s->mount_name[3] = (char)('0' + (v / 10));
-		s->mount_name[4] = (char)('0' + (v % 10));
-		s->mount_name[5] = '\0';
+		char *d = s->mount_name;
+		LONG v = cfg_port;
+		char digits[8];
+		int nd = 0;
+
+		*d++ = 'T';
+		if (v <= 0) v = 0;
+		do { digits[nd++] = (char)('0' + (v % 10)); v /= 10; } while (v > 0 && nd < 8);
+		while (nd > 0) *d++ = digits[--nd];
+		*d++ = (char)('A' + (session_no % 26));
+		*d = '\0';
 	}
 
 	s->port      = CreateMsgPort();
@@ -568,7 +599,15 @@ static int session_start(struct Session *s, LONG sock, LONG session_no)
 	s->devnode->dol_Task = s->port;
 	if (!AddDosEntry(s->devnode))
 	{
-		say("telnetd: mount name already in use\n");
+		/* Tell the client. A connection that is accepted and then
+		 * silently dropped is the worst outcome available -- the caller
+		 * cannot tell it from a hang. */
+		static const char clash[] =
+			"\r\ntelnetd: could not create a console for this session.\r\n";
+		say("telnetd: mount name already in use: ");
+		say((CONST_STRPTR)s->mount_name);
+		say("\n");
+		send(s->sock, (APTR)clash, (LONG)sizeof(clash) - 1, 0);
 		FreeDosEntry(s->devnode);
 		s->devnode = NULL;
 		goto fail;
@@ -727,10 +766,6 @@ static void session_service(struct Session *s, int readable)
  * the parent parsed. Nothing is passed through the startup message because
  * nothing needs to be: there is only ever one daemon per process image.
  */
-static LONG         cfg_port      = DEFAULT_PORT;
-static LONG         cfg_wait      = 0;
-static CONST_STRPTR cfg_bind      = NULL;
-static CONST_STRPTR cfg_logfile   = NULL;
 
 static void daemon_main(void);
 
