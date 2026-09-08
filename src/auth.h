@@ -13,7 +13,8 @@ enum AuthResult
 {
 	AUTH_OK = 0,
 	AUTH_NO_SUCH_USER,	/* no entry for that name */
-	AUTH_NO_PASSWORD_SET,	/* entry exists but has no password -- REFUSE */
+	AUTH_NO_PASSWORD_SET,	/* no password set -- REFUSE */
+	AUTH_LOCKED,		/* explicitly locked with '*' -- REFUSE */
 	AUTH_BAD_CREDENTIALS	/* wrong password */
 };
 

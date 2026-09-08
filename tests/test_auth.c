@@ -42,6 +42,16 @@ int main(void)
 	CHECK(auth_policy("", "") == AUTH_NO_PASSWORD_SET,
 	      "and an empty attempt does not sneak past it");
 
+	printf("an EXPLICITLY LOCKED account (*) is refused\n");
+	CHECK(auth_policy("*", "anything") == AUTH_LOCKED,
+	      "'*' is a lock, not a hash -- refuse it by name");
+	CHECK(auth_policy("*", "*") == AUTH_LOCKED,
+	      "and it cannot be matched by supplying '*' either");
+
+	printf("a hash that merely STARTS with * is still a hash\n");
+	CHECK(auth_policy("*abc", "*abc") == AUTH_OK,
+	      "only a bare '*' means locked");
+
 	printf("an unknown user is refused\n");
 	CHECK(auth_policy(0, "anything") == AUTH_NO_SUCH_USER, "NULL stored entry");
 
