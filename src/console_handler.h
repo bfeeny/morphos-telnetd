@@ -27,6 +27,14 @@
  * run -- we define them ourselves, with the same values, so the tests exercise
  * the real dispatch rather than a mock of it.
  */
+/*
+ * ACTION_SESSION_MODE is IXEMUL'S OWN PACKET, not AmigaDOS's. It is defined in
+ * ixemul.library/library/_cli_parse.c:60 and appears in no SDK header, which is
+ * why it arrives as an unidentifiable 991 and only ever from ixemul binaries.
+ * Identified by morphos-oracle from the ixemul source.
+ */
+#define ACTION_SESSION_MODE 991
+
 #ifdef __MORPHOS__
 #  include <dos/dos.h>
 #  include <dos/dosextens.h>
@@ -125,6 +133,8 @@ struct ConsoleState
 	 */
 	void *signal_port;	/* struct MsgPort * -- signal port->mp_SigTask */
 	long  signals_seen;
+
+	long  session_mode_asks;	/* ACTION_SESSION_MODE, ixemul startup */
 
 	/*
 	 * Window size, and the machinery for reporting it.

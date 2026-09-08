@@ -87,6 +87,31 @@ static void setup(struct ConsoleState *st, struct FakeIO *io, const char *input)
 
 /* ---- tests ------------------------------------------------------------- */
 
+/*
+ * ACTION_SESSION_MODE (991) is ixemul's private packet, not AmigaDOS's.
+ * Answering NO -- or answering DOSTRUE in only one of the two result fields --
+ * leaves IXTTY_SPECIAL unset, and ixemul then writes 0x84 instead of a newline
+ * as soon as a program clears ONLCR. Over a socket that is garbage, and it
+ * appears only in raw mode, which is the hardest case to notice by hand.
+ */
+static void test_session_mode_answers_yes_in_both_fields(void)
+{
+	struct ConsoleState st;
+	struct FakeIO io;
+	struct ConsoleReply r;
+
+	printf("ACTION_SESSION_MODE is answered DOSTRUE in BOTH result fields\n");
+	setup(&st, &io, NULL);
+
+	r = console_dispatch(&st, ACTION_SESSION_MODE, 0, 0, NULL, 0);
+
+	CHECK(r.res1 == DOSTRUE, "res1 says yes");
+	CHECK(r.res2 == DOSTRUE, "res2 says yes -- ixemul requires both");
+	CHECK(r.defer == 0, "and it is answered immediately");
+	CHECK(st.unknown == 0, "it is not counted as an unknown packet");
+	CHECK(st.session_mode_asks == 1, "the ask is recorded");
+}
+
 static void test_read_delivers_input(void)
 {
 	struct ConsoleState st;
@@ -606,6 +631,8 @@ static void test_session_ends_once_established_and_released(void)
 int main(void)
 {
 	printf("shell-attach packet logic -- host tests\n\n");
+
+	test_session_mode_answers_yes_in_both_fields();
 
 	test_read_delivers_input();
 	test_read_rejects_bad_arguments();

@@ -990,6 +990,95 @@ static struct FileHandle *make_handle(struct MsgPort *port, LONG mode, LONG id)
  * `deferred` may be NULL, meaning this caller cannot hold a packet back; a
  * read that would block is then answered EOF instead.
  */
+/*
+ * ACTION_EXAMINE_FH -- fstat() on a console.
+ *
+ * Answered HERE and not in console_handler.c on purpose: it is the one packet
+ * whose reply is a MorphOS structure written into the caller's memory, and that
+ * layer is deliberately free of MorphOS types so it can be tested on the build
+ * host. An sshd reusing the shell-attach layer needs this function too; it is
+ * self-contained so it can be lifted whole.
+ *
+ * WHY IT MATTERS: ixemul turns fstat() into this packet, so EVERY ixemul binary
+ * in the SDK stats its console. Refusing it looked harmless because pdksh
+ * ignores the failure -- but that is luck, not design, and the trail only
+ * started because amigacode mis-reported pdksh as unusable over telnet and I
+ * went looking for a fault in this handler.
+ *
+ * WHAT TO PUT IN IT, from ixemul's own source rather than guesswork
+ * (ixemul.library/library/__fstat.c and stat.c):
+ *
+ *   - fib_DirEntryType = ST_PIPEFILE. stat.c maps ST_PIPEFILE to S_IFCHR, which
+ *     is what a terminal should be. __fstat.c carries a complaint about
+ *     handlers that "support EXAMINE_FH but don't know yet about ST_PIPEFILE,
+ *     so console windows claim they're plain files", and does an extra Seek to
+ *     catch those fakers. Reporting ST_FILE would make us one of them.
+ *   - fib_Size 0, and it is only consulted when fib_DirEntryType is negative,
+ *     which ST_PIPEFILE is.
+ *   - fib_Protection 0. Amiga protection bits are ACTIVE LOW for RWED, and
+ *     stat.c does `fib_Protection ^= 0xf` before reading them, so zero means
+ *     read, write, execute and delete all permitted.
+ *
+ * isatty() does NOT depend on any of this -- ixemul implements it with
+ * IsInteractive() -- so answering cannot break interactivity. That was the risk
+ * worth checking before writing into somebody else's buffer, and the source
+ * settled it.
+ */
+static int answer_examine_fh(struct DosPacket *pkt)
+{
+	struct FileInfoBlock *fib;
+	const char *name = "CONSOLE";
+	int i;
+
+	if (pkt->dp_Type == ACTION_PARENT_FH
+	 || pkt->dp_Type == ACTION_COPY_DIR_FH)
+	{
+		/*
+		 * A console has no parent directory and no directory to copy.
+		 * Say THAT, rather than "I do not know this action", which is a
+		 * different claim: we know the action perfectly well and the
+		 * object genuinely has no such thing.
+		 *
+		 * Both appear only once EXAMINE_FH starts succeeding -- ixemul's
+		 * fstat goes on to build an st_ino and asks for them -- so they
+		 * arrived as a direct consequence of answering that packet.
+		 */
+		ReplyPkt(pkt, DOSFALSE, ERROR_OBJECT_NOT_FOUND);
+		return 1;
+	}
+
+	if (pkt->dp_Type != ACTION_EXAMINE_FH)
+		return 0;
+
+	fib = (struct FileInfoBlock *)BADDR((BPTR)pkt->dp_Arg2);
+	if (fib == NULL)
+	{
+		ReplyPkt(pkt, DOSFALSE, ERROR_OBJECT_WRONG_TYPE);
+		return 1;
+	}
+
+	memset(fib, 0, sizeof(*fib));
+
+	fib->fib_DiskKey      = 0;
+	fib->fib_DirEntryType = ST_PIPEFILE;
+	fib->fib_EntryType    = ST_PIPEFILE;
+	fib->fib_Protection   = 0;
+	fib->fib_Size         = 0;
+	fib->fib_NumBlocks    = 0;
+	fib->fib_OwnerUID     = 0;
+	fib->fib_OwnerGID     = 0;
+
+	for (i = 0; name[i] && i < (int)sizeof(fib->fib_FileName) - 1; i++)
+		fib->fib_FileName[i] = name[i];
+	fib->fib_FileName[i] = '\0';
+	fib->fib_Comment[0]  = '\0';
+
+	DateStamp(&fib->fib_Date);
+
+	ReplyPkt(pkt, DOSTRUE, 0);
+	return 1;
+}
+
 static long service_port(struct MsgPort *port, struct ConsoleState *con,
                          struct DosPacket **deferred, long *ndef, long maxdef)
 {
@@ -1005,6 +1094,10 @@ static long service_port(struct MsgPort *port, struct ConsoleState *con,
 		LONG  len = 0;
 
 		if (pkt == NULL)
+			continue;
+
+		/* Packets whose answer is a MorphOS structure, not a decision. */
+		if (answer_examine_fh(pkt))
 			continue;
 
 		if (pkt->dp_Type == ACTION_READ || pkt->dp_Type == ACTION_WRITE)

@@ -29,6 +29,7 @@ void console_init(struct ConsoleState *st,
 	st->unknown      = 0;
 	st->signal_port  = 0;
 	st->signals_seen = 0;
+	st->session_mode_asks = 0;
 	/*
 	 * A DEFAULT SIZE, not "unknown".
 	 *
@@ -348,6 +349,35 @@ struct ConsoleReply console_dispatch(struct ConsoleState *st,
 			st->inconsistent = 1;
 		}
 		r.res1 = DOSTRUE;
+		break;
+
+	case ACTION_SESSION_MODE:
+		/*
+		 * "Are you a linux compatible console handler?" -- ixemul's
+		 * private packet, asked once per stream at startup.
+		 *
+		 * ANSWERING NO CORRUPTS OUTPUT IN RAW MODE. ixemul sets
+		 * IXTTY_SPECIAL only if BOTH dp_Res1 AND dp_Res2 come back
+		 * DOSTRUE (_cli_parse.c:216), and without that flag __write.c
+		 * substitutes 0x84 -- the Amiga console's INDEX control -- for
+		 * every newline once a program clears ONLCR/OPOST:
+		 *
+		 *   if ((!(f->f_ttyflags & IXTTY_SPECIAL)) && ...)
+		 *       tmp = __do_sync_write(f, "\204", 1);
+		 *
+		 * Clearing ONLCR is what a full-screen or line-editing program
+		 * does, so the failure appears exactly where it is hardest to
+		 * notice by hand, and a telnet client receives 0x84 where it
+		 * expects LF. On a real Amiga console 0x84 is correct; over a
+		 * socket whose far end is a real terminal it is garbage.
+		 *
+		 * We are "linux compatible" in precisely the sense meant: bytes
+		 * go to a stream whose other end wants LF. Source and reasoning
+		 * from morphos-oracle, out of the ixemul source.
+		 */
+		st->session_mode_asks++;
+		r.res1 = DOSTRUE;
+		r.res2 = DOSTRUE;	/* BOTH, or the flag is not set */
 		break;
 
 	case ACTION_CHANGE_SIGNAL:
