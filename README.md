@@ -44,6 +44,7 @@ telnetd [-p port] [-b address] [-d] [-t seconds] [-l logfile] [-a]
   -b   bind to one address          (default: all interfaces)
   -d   detach and run in background (for boot scripts and supervisors)
   -t   seconds to wait for the first connection, 0 = forever
+  -n   seconds to wait for the network stack (for boot scripts)
   -l   write diagnostics to a file
   -a   DISABLE AUTHENTICATION -- development only, see SECURITY.md
 ```

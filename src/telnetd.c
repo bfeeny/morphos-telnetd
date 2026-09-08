@@ -392,6 +392,7 @@ static LONG         cfg_wait      = 0;
 static CONST_STRPTR cfg_bind      = NULL;
 static CONST_STRPTR cfg_logfile   = NULL;
 static CONST_STRPTR cfg_readyport = NULL;
+static LONG         cfg_netwait   = 0;
 
 
 /* ------------------------------------------------------------------ */
@@ -1496,6 +1497,13 @@ int main(int argc, char **argv)
 		{
 			cfg_bind = (CONST_STRPTR)argv[++i];
 		}
+		else if (argv[i][0] == '-' && argv[i][1] == 'n' && i + 1 < argc)
+		{
+			LONG v = 0;
+			CONST_STRPTR q = (CONST_STRPTR)argv[++i];
+			while (*q >= '0' && *q <= '9') v = v * 10 + (*q++ - '0');
+			cfg_netwait = v;
+		}
 		else if (argv[i][0] == '-' && argv[i][1] == 'a')
 		{
 			allow_no_auth = 1;
@@ -1609,11 +1617,40 @@ static void daemon_main(void)
 	if (cfg_logfile)
 		logfh = Open(cfg_logfile, MODE_NEWFILE);
 
-	SocketBase = OpenLibrary("bsdsocket.library", 4);
-	if (SocketBase == NULL)
+	/*
+	 * Wait for the network stack, if asked to.
+	 *
+	 * Started from a boot script there is no guarantee the stack is up yet,
+	 * and the failure is a race: it works when you test it and fails on the
+	 * one boot that matters. -n says how long to keep asking. It is opt-in
+	 * and defaults to nothing, so an ordinary launch still fails at once
+	 * rather than hanging for a minute on a machine with no networking.
+	 *
+	 * Deliberately only around OpenLibrary. bind() failing is a DIFFERENT
+	 * fact -- the port is taken -- and retrying that would turn "somebody
+	 * else is already listening" into a long silence.
+	 */
 	{
-		say("telnetd: cannot open bsdsocket.library\n");
-		return;
+		LONG waited = 0;
+
+		for (;;)
+		{
+			SocketBase = OpenLibrary("bsdsocket.library", 4);
+			if (SocketBase != NULL || waited >= cfg_netwait)
+				break;
+			if (waited == 0)
+				say("telnetd: waiting for the network stack\n");
+			Delay(50);	/* one second: 50 ticks */
+			waited++;
+		}
+
+		if (SocketBase == NULL)
+		{
+			say("telnetd: cannot open bsdsocket.library\n");
+			return;
+		}
+		if (waited > 0)
+			say_num("telnetd: network stack appeared after seconds = ", waited);
 	}
 
 	UserGroupBase = OpenLibrary("usergroup.library", 0);
