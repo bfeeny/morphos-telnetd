@@ -12,14 +12,19 @@ CFLAGS  = -noixemul -O2 -Wall -Wextra -Wno-unused-parameter \
           -I$(SDK)/gg/os-include
 
 TARGET  = conprobe
+EXTRA   = starprobe
 
-all: $(TARGET)
+all: $(TARGET) $(EXTRA)
 
 $(TARGET): conprobe.c ../src/console_handler.c ../src/console_handler.h
 	$(CROSS) $(CFLAGS) -o $@ conprobe.c ../src/console_handler.c
 	@echo "--- built: $$(file $@) ---"
 
 clean:
-	rm -f $(TARGET)
+	rm -f $(TARGET) $(EXTRA)
 
 .PHONY: all clean
+
+starprobe: starprobe.c
+	$(CROSS) $(CFLAGS) -o $@ starprobe.c
+	@echo "--- built: $$(file $@) ---"
