@@ -405,16 +405,58 @@ static LONG         cfg_netwait   = 0;
  * probe learned the same lesson -- instrumentation has to outlive the failure
  * it is describing.
  */
-static BPTR logfh = 0;
+/*
+ * The log is opened, appended to, and closed FOR EVERY LINE.
+ *
+ * It used to be held open for the daemon's whole life, and that had two
+ * consequences, both reported from the far end by amigacode.
+ *
+ * A running daemon's log could not be read AT ALL -- Type, Copy and a POSIX
+ * read all failed with "object is in use" -- so the only way to see what a
+ * daemon was doing was to stop the daemon and destroy the state you wanted to
+ * look at. And any exit that skipped the one Close() left the file locked by a
+ * process that no longer existed, until reboot, which is how a failed boot came
+ * to make its own explanation unreadable.
+ *
+ * Both are the same fault: the diagnostic was unavailable exactly when it was
+ * needed. A few DOS calls per line is nothing next to that -- this logs a
+ * handful of lines per session, never in the data path.
+ */
+static int log_started = 0;	/* first write truncates, the rest append */
+static int log_enabled = 0;	/* only the daemon writes; the parent must not */
+
+static void log_line(CONST_STRPTR text, LONG len)
+{
+	BPTR f;
+
+	if (!cfg_logfile || !log_enabled || len <= 0)
+		return;
+
+	f = Open(cfg_logfile, log_started ? MODE_READWRITE : MODE_NEWFILE);
+	if (!f)
+		return;
+
+	if (log_started)
+		Seek(f, 0, OFFSET_END);
+
+	Write(f, (APTR)text, len);
+	Close(f);
+	log_started = 1;
+}
 
 static void say(CONST_STRPTR s)
 {
-	BPTR out = logfh ? logfh : Output();
-	if (out)
+	LONG len = (LONG)strlen(s);
+
+	if (cfg_logfile && log_enabled)
 	{
-		Write(out, (APTR)s, (LONG)strlen(s));
-		if (logfh)
-			Flush(logfh);	/* a crash must not lose the last line */
+		log_line(s, len);
+	}
+	else
+	{
+		BPTR out = Output();
+		if (out)
+			Write(out, (APTR)s, len);
 	}
 }
 
@@ -433,14 +475,15 @@ static void say_num(CONST_STRPTR prefix, LONG value)
 	if (neg && p > buf) *--p = '-';
 
 	say(prefix);
+	if (cfg_logfile && log_enabled)
 	{
-		BPTR out = logfh ? logfh : Output();
+		log_line((CONST_STRPTR)p, (LONG)(buf + sizeof(buf) - p));
+	}
+	else
+	{
+		BPTR out = Output();
 		if (out)
-		{
 			Write(out, p, (LONG)(buf + sizeof(buf) - p));
-			if (logfh)
-				Flush(logfh);
-		}
 	}
 }
 
@@ -530,10 +573,34 @@ static void net_out(void *ctx, const unsigned char *buf, long len)
 		{
 			net_flush(s);
 			room = OUTBUF_SIZE - s->out_len;
-			if (room <= 0 && !net_stall(s))
+			if (room > 0)
+				continue;
+
+			/*
+			 * NEVER STALL FOR A CLIENT THAT HAS NOT LOGGED IN.
+			 *
+			 * net_stall() holds up the entire daemon for a couple of
+			 * seconds. Before login the only output is our own
+			 * prompts and option replies -- and both are generated
+			 * PER INPUT BYTE, so a stranger who connects, never
+			 * reads, and sends 100 KB of carriage returns could make
+			 * every 1024-byte read trigger some two thousand stalls
+			 * and freeze all four sessions and the accept loop for
+			 * over an hour. The login deadline could not fire,
+			 * because the loop never got back to it.
+			 *
+			 * A caller who will not read its own login prompt is
+			 * owed nothing. Hang up on it.
+			 */
+			if (s->phase != PHASE_SHELL)
 			{
-				/* Say so. Silent loss is the fault being fixed;
-				 * loud loss is at least explicable. */
+				say("telnetd: caller is not reading its own prompt; dropping it\n");
+				s->peer_gone = 1;
+				return;
+			}
+
+			if (!net_stall(s))
+			{
 				say("telnetd: output queue full -- DROPPING shell output\n");
 				return;
 			}
@@ -1023,11 +1090,36 @@ static void session_end(struct Session *s)
 	 * Not finished: a reaper keeps answering it until the Shell lets go.
 	 */
 	if (!s->shell_started)
-		port_put(s->port);	/* no Shell was ever pointed at it */
+	{
+		/*
+		 * No Shell was ever pointed at any of this, so it is all still
+		 * ours -- and the file handles really do have to go back.
+		 * AllocDosObject'd in session_start for EVERY accepted caller,
+		 * they were only ever freed by the helper's Close() (when a
+		 * Shell was launched) or by the fail: path. A refused login, a
+		 * timed-out one, or "authentication unavailable" leaked both,
+		 * before any authentication, without limit, until reboot.
+		 */
+		if (s->fh_in)  FreeDosObject(DOS_FILEHANDLE, s->fh_in);
+		if (s->fh_out) FreeDosObject(DOS_FILEHANDLE, s->fh_out);
+		port_put(s->port);
+	}
 	else if (s->helper_done && console_session_finished(&s->con))
 		port_put(s->port);
 	else if (!reaper_adopt(s))
+	{
+		/*
+		 * Nothing will read this port again, so nothing should be
+		 * signalled through it either. PA_IGNORE makes PutMsg enqueue
+		 * and return: harmless while we live, and essential if we do
+		 * not -- otherwise a Shell outliving the daemon signals a Task
+		 * that has been freed, which is not an error, it is a dead
+		 * machine.
+		 */
 		say("telnetd: no reaper free -- abandoning a console port\n");
+		if (s->port)
+			s->port->mp_Flags = PA_IGNORE;
+	}
 	s->port = NULL;
 
 	if (s->helper_done || !s->shell_started)
@@ -1037,6 +1129,12 @@ static void session_end(struct Session *s)
 		 * bit gone per refused login. */
 		if (s->replyport) DeleteMsgPort(s->replyport);
 		if (s->sm)        FreeVec(s->sm);
+	}
+	else if (s->replyport)
+	{
+		/* Kept because the helper may still reply to it, but nobody
+		 * will ever read it again -- so it must not signal us either. */
+		s->replyport->mp_Flags = PA_IGNORE;
 	}
 	s->replyport = NULL;
 	s->sm = NULL;
@@ -1312,12 +1410,33 @@ static void session_service(struct Session *s, int readable, int writable)
 	{
 		unsigned char raw[1024];
 		int  secret = (s->phase == PHASE_PASS || s->phase == PHASE_USER);
-		LONG got = recv(s->sock, raw, sizeof(raw), 0);
+		long room   = INBUF_SIZE - s->in_len;
+		LONG got;
+
+		/*
+		 * Ask for no more than we can keep.
+		 *
+		 * Dropping the socket from the read set when the buffer is FULL
+		 * was 1023 bytes too late: this always asked for 1024 and then
+		 * handed telnet_input only the remaining room, so everything
+		 * past it was parsed and silently discarded. Paste 5 KB while
+		 * the Shell is busy and the tail vanished with no trace.
+		 *
+		 * Safe because telnet_input never emits more bytes than it
+		 * consumes -- its only two-for-one branch consumes two.
+		 */
+		if (room > (long)sizeof(raw))
+			room = (long)sizeof(raw);
+		if (room <= 0)
+			goto no_read;
+
+		got = recv(s->sock, raw, room, 0);
 
 		if (got > 0)
 		{
-			long room = INBUF_SIZE - s->in_len;
-			long n = telnet_input(&s->tn, raw, got, s->in + s->in_len, room);
+			long n = telnet_input(&s->tn, raw, got,
+			                      s->in + s->in_len,
+			                      INBUF_SIZE - s->in_len);
 			s->in_len += n;
 			if (s->phase != PHASE_SHELL)
 				login_consume(s);
@@ -1366,6 +1485,7 @@ static void session_service(struct Session *s, int readable, int writable)
 			for (k = 0; k < (LONG)sizeof(raw); k++)
 				raw[k] = 0;
 		}
+	no_read: ;
 	}
 
 	/* Reads held back because the socket had nothing to give them. */
@@ -1638,8 +1758,7 @@ static void daemon_main(void)
 	for (i = 0; i < MAX_SESSIONS; i++)
 		sessions[i].sock = -1;
 
-	if (cfg_logfile)
-		logfh = Open(cfg_logfile, MODE_NEWFILE);
+	log_enabled = 1;	/* from here the daemon owns the log file */
 
 	/*
 	 * Say what we were asked to do, before doing any of it.
@@ -2049,5 +2168,5 @@ done:
 	if (SocketBase && listener >= 0) CloseSocket(listener);
 	if (UserGroupBase)      CloseLibrary(UserGroupBase);
 	if (SocketBase)         CloseLibrary(SocketBase);
-	if (logfh) { say("telnetd: exit\n"); Close(logfh); logfh = 0; }
+	say("telnetd: exit\n");
 }

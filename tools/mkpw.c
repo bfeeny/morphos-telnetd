@@ -86,12 +86,25 @@ static long read_file(CONST_STRPTR path, char *buf, long max)
 	long n;
 
 	if (!f)
-		return 0;
+	{
+		/*
+		 * "Absent" and "there but unreadable" are NOT the same answer,
+		 * and treating both as an empty file is how this tool would
+		 * have destroyed the database it exists to protect: with n = 0
+		 * the merge preserves nothing, and the new entry is installed
+		 * as the WHOLE user database. Preferences holding the file open
+		 * is enough to trigger it.
+		 */
+		if (IoErr() == ERROR_OBJECT_NOT_FOUND)
+			return 0;
+		return -1;
+	}
+
 	n = Read(f, buf, max);
 	Close(f);
 
 	if (n < 0)
-		n = 0;
+		return -1;	/* a read error is not an empty file either */
 	if (n >= max)
 		return -1;	/* filled the buffer: there may well be more */
 
@@ -180,8 +193,10 @@ static BOOL merge_file(CONST_STRPTR path, const char *user, const char *line)
 	n = read_file(path, in, (long)sizeof(in));
 	if (n < 0)
 	{
-		say("mkpw: the existing file is bigger than this tool can rewrite\n");
-		say("      safely; refusing rather than risk dropping accounts\n");
+		say("mkpw: cannot read the existing file -- it may be locked by\n");
+		say("      Preferences, or larger than this tool can rewrite.\n");
+		say("      Refusing: a merge that cannot see the old entries\n");
+		say("      would replace them all with this one.\n");
 		return FALSE;
 	}
 
@@ -359,31 +374,60 @@ int main(int argc, char **argv)
 		line[n] = '\0';
 	}
 
-	if (!live)
+	/*
+	 * The exit status has to mean something.
+	 *
+	 * Every refusal above used to print its reason and then fall through to
+	 * "entry created" and RETURN_OK -- so a passwd file too big to rewrite
+	 * produced "refusing", then "entry created", then success, and any
+	 * script reading the status believed the account existed. With -live the
+	 * ENV and ENVARC copies could also disagree under the same rc.
+	 */
 	{
-		if (!merge_file((CONST_STRPTR)PW_TEST, user, line))
-			say("mkpw: could not write " PW_TEST "\n");
+		int failures = 0;
+
+		if (!live)
+		{
+			if (!merge_file((CONST_STRPTR)PW_TEST, user, line))
+			{
+				say("mkpw: could not write " PW_TEST "\n");
+				failures++;
+			}
+			else
+				say("mkpw: wrote " PW_TEST " (test file; system untouched)\n");
+		}
 		else
-			say("mkpw: wrote " PW_TEST " (test file; system untouched)\n");
+		{
+			say("mkpw: -live given; writing the SYSTEM user database\n");
+
+			if (!merge_file((CONST_STRPTR)PW_ENV, user, line))
+			{
+				say("mkpw: could not write " PW_ENV "\n");
+				failures++;
+			}
+			else
+				say("mkpw: wrote " PW_ENV "\n");
+
+			if (!merge_file((CONST_STRPTR)PW_ENVARC, user, line))
+			{
+				say("mkpw: could not write " PW_ENVARC "\n");
+				failures++;
+			}
+			else
+				say("mkpw: wrote " PW_ENVARC "\n");
+		}
+
+		CloseLibrary(UserGroupBase);
+
+		if (failures)
+		{
+			say("mkpw: NO entry was created -- see the reason above\n");
+			return RETURN_ERROR;
+		}
+
+		say("mkpw: entry created for '");
+		say((CONST_STRPTR)user);
+		say("' -- hash not shown by design\n");
+		return RETURN_OK;
 	}
-	else
-	{
-		say("mkpw: -live given; writing the SYSTEM user database\n");
-		if (!merge_file((CONST_STRPTR)PW_ENV, user, line))
-			say("mkpw: could not write " PW_ENV "\n");
-		else
-			say("mkpw: wrote " PW_ENV "\n");
-
-		if (!merge_file((CONST_STRPTR)PW_ENVARC, user, line))
-			say("mkpw: could not write " PW_ENVARC "\n");
-		else
-			say("mkpw: wrote " PW_ENVARC "\n");
-	}
-
-	say("mkpw: entry created for '");
-	say((CONST_STRPTR)user);
-	say("' -- hash not shown by design\n");
-
-	CloseLibrary(UserGroupBase);
-	return RETURN_OK;
 }
