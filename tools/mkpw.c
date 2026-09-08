@@ -1,7 +1,16 @@
 /*
  * mkpw -- create a well-formed entry in the MorphOS user database.
  *
- *   mkpw <user> <password> [uid] [gid]
+ *   mkpw <user> <password> [uid] [gid]          -> writes a TEST file
+ *   mkpw -live <user> <password> [uid] [gid]     -> writes the system database
+ *
+ * THE LIVE DATABASE REQUIRES AN EXPLICIT FLAG. This tool writes
+ * Work:morphos-agent/work-telnetd/passwd.test by default and touches nothing
+ * the system reads. That is not caution for its own sake: writing the live path
+ * on every test run destroyed the machine owner's account, and very possibly
+ * the only copy of a credential we were trying to locate. A tool that mutates
+ * shared state as its DEFAULT behaviour will eventually do it at the worst
+ * moment. Make the dangerous thing require an act.
  *
  * MorphOS ships usergroup.library and netinfo.device but nothing that
  * POPULATES the passwd unit, so there is no supported way to create an account
@@ -45,6 +54,7 @@ struct Library *UserGroupBase = NULL;
 
 #define PW_ENV    "ENV:sys/net/passwd"
 #define PW_ENVARC "ENVARC:sys/net/passwd"
+#define PW_TEST   "passwd.test"
 
 static void say(CONST_STRPTR s)
 {
@@ -147,18 +157,29 @@ int main(int argc, char **argv)
 	char salt[64];
 	const char *user, *pass;
 	const char *uid = "1000", *gid = "100";
+	int live = 0;
 	char *hash;
 	int n = 0;
 
-	if (argc < 3)
 	{
-		say("usage: mkpw <user> <password> [uid] [gid]\n");
-		return RETURN_ERROR;
+		int a = 1;
+
+		if (argc > 1 && argv[1][0] == '-' && argv[1][1] == 'l')
+		{
+			live = 1;
+			a = 2;
+		}
+		if (argc < a + 2)
+		{
+			say("usage: mkpw [-live] <user> <password> [uid] [gid]\n");
+			say("  without -live, writes " PW_TEST " and touches nothing else\n");
+			return RETURN_ERROR;
+		}
+		user = argv[a];
+		pass = argv[a + 1];
+		if (argc > a + 2) uid = argv[a + 2];
+		if (argc > a + 3) gid = argv[a + 3];
 	}
-	user = argv[1];
-	pass = argv[2];
-	if (argc > 3) uid = argv[3];
-	if (argc > 4) gid = argv[4];
 
 	if (has_pipe(user) || has_pipe(uid) || has_pipe(gid))
 	{
@@ -216,15 +237,26 @@ int main(int argc, char **argv)
 		line[n] = '\0';
 	}
 
-	if (!merge_file((CONST_STRPTR)PW_ENV, user, line))
-		say("mkpw: could not write " PW_ENV "\n");
+	if (!live)
+	{
+		if (!merge_file((CONST_STRPTR)PW_TEST, user, line))
+			say("mkpw: could not write " PW_TEST "\n");
+		else
+			say("mkpw: wrote " PW_TEST " (test file; system untouched)\n");
+	}
 	else
-		say("mkpw: wrote " PW_ENV "\n");
+	{
+		say("mkpw: -live given; writing the SYSTEM user database\n");
+		if (!merge_file((CONST_STRPTR)PW_ENV, user, line))
+			say("mkpw: could not write " PW_ENV "\n");
+		else
+			say("mkpw: wrote " PW_ENV "\n");
 
-	if (!merge_file((CONST_STRPTR)PW_ENVARC, user, line))
-		say("mkpw: could not write " PW_ENVARC "\n");
-	else
-		say("mkpw: wrote " PW_ENVARC "\n");
+		if (!merge_file((CONST_STRPTR)PW_ENVARC, user, line))
+			say("mkpw: could not write " PW_ENVARC "\n");
+		else
+			say("mkpw: wrote " PW_ENVARC "\n");
+	}
 
 	say("mkpw: entry created for '");
 	say((CONST_STRPTR)user);
