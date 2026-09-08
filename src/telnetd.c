@@ -1642,6 +1642,28 @@ static void daemon_main(void)
 		logfh = Open(cfg_logfile, MODE_NEWFILE);
 
 	/*
+	 * Say what we were asked to do, before doing any of it.
+	 *
+	 * The boot failure that prompted this left a THIRTY-NINE BYTE log whose
+	 * single line was either "waiting for the network stack" or "cannot open
+	 * bsdsocket.library" -- two different failures whose messages happen to
+	 * be the same length, so the file recorded that something went wrong
+	 * without recording which thing. A log that cannot distinguish its own
+	 * failure modes is decoration.
+	 *
+	 * These lines also prove the arguments arrived: the child is launched
+	 * from a command line this program rebuilt, and "-n was silently
+	 * dropped" and "the stack really was absent" look identical from
+	 * outside.
+	 */
+	say("telnetd: start\n");
+	say_num("telnetd: port = ", cfg_port);
+	say_num("telnetd: network wait secs = ", cfg_netwait);
+	say_num("telnetd: first-connection timeout secs = ", cfg_wait);
+	if (allow_no_auth)
+		say("telnetd: *** AUTHENTICATION DISABLED ***\n");
+
+	/*
 	 * Wait for the network stack, if asked to.
 	 *
 	 * Started from a boot script there is no guarantee the stack is up yet,
@@ -1671,7 +1693,8 @@ static void daemon_main(void)
 		if (SocketBase == NULL)
 		{
 			say("telnetd: cannot open bsdsocket.library\n");
-			return;
+			say_num("telnetd: gave up after seconds = ", waited);
+			goto done;
 		}
 		if (waited > 0)
 			say_num("telnetd: network stack appeared after seconds = ", waited);
@@ -1697,15 +1720,15 @@ static void daemon_main(void)
 		say("telnetd: usergroup.library not available and no bypass given.\n");
 		say("telnetd: refusing to start rather than serve unauthenticated shells.\n");
 		CloseLibrary(SocketBase);
-		return;
+		SocketBase = NULL;
+		goto done;
 	}
 
 	listener = socket(AF_INET, SOCK_STREAM, 0);
 	if (listener < 0)
 	{
 		say("telnetd: socket() failed\n");
-		CloseLibrary(SocketBase);
-		return;
+		goto done;
 	}
 
 	setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, (APTR)&yes, sizeof(yes));
@@ -1717,10 +1740,10 @@ static void daemon_main(void)
 
 	if (bind(listener, (struct sockaddr *)&addr, sizeof(addr)) < 0)
 	{
-		say("telnetd: bind() failed -- port in use?\n");
+		say_num("telnetd: bind() failed -- port in use? port = ", port_no);
 		CloseSocket(listener);
-		CloseLibrary(SocketBase);
-		return;
+		listener = -1;
+		goto done;
 	}
 
 	/* A real backlog. With a backlog of 1 the kernel completed handshakes
@@ -1730,8 +1753,8 @@ static void daemon_main(void)
 	{
 		say("telnetd: listen() failed\n");
 		CloseSocket(listener);
-		CloseLibrary(SocketBase);
-		return;
+		listener = -1;
+		goto done;
 	}
 
 	/*
@@ -1922,7 +1945,24 @@ static void daemon_main(void)
 			port_pool[i]->mp_Flags = PA_IGNORE;
 
 	CloseSocket(listener);
-	if (UserGroupBase) CloseLibrary(UserGroupBase);
-	CloseLibrary(SocketBase);
+	listener = -1;
+
+done:
+	/*
+	 * ONE EXIT, because the log has to be closed on every path.
+	 *
+	 * Each failure used to `return` straight out, leaving the log file
+	 * handle open in a process that then ceased to exist. On a platform
+	 * that reclaims nothing, that is a lock held by nobody until the next
+	 * reboot -- so the boot that failed made its own explanation
+	 * unreadable, and the only thing that could say why refused to open.
+	 * Reported from the far end by amigacode, who had a silent port, a
+	 * locked 39-byte log and no way to see inside it.
+	 *
+	 * A failure must never take its reason with it.
+	 */
+	if (listener >= 0)      CloseSocket(listener);
+	if (UserGroupBase)      CloseLibrary(UserGroupBase);
+	if (SocketBase)         CloseLibrary(SocketBase);
 	if (logfh) { say("telnetd: exit\n"); Close(logfh); logfh = 0; }
 }
