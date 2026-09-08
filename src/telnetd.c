@@ -78,11 +78,47 @@ static int allow_no_auth = 0;
  */
 #define TD_FIONBIO 0x8004667EUL
 
+/*
+ * Socket error codes, spelled out for the same reason.
+ *
+ * bsdsocket's Errno() returns the BSD values, but the header that NAMES them is
+ * gg/include/errno.h -- the ixemul tree again, off limits to a -noixemul build.
+ * Taken from that header, lines 56 and 96:
+ *
+ *     #define EINTR   4
+ *     #define EAGAIN 35        and  #define EWOULDBLOCK EAGAIN
+ */
+#define TD_EINTR         4
+#define TD_EWOULDBLOCK  35
+
 #define DEFAULT_PORT   23
 #define MOUNT_NAME     "TELCON"
 #define SHELL_COMMAND  "NewShell " MOUNT_NAME ":"
 #define INBUF_SIZE     4096
 #define MAX_DEFERRED   8
+
+/*
+ * Output waiting for the socket.
+ *
+ * A non-blocking send() takes what the kernel has room for and no more, and
+ * net_out() used to ignore both the short count and the outright refusal while
+ * telling the Shell every byte had been consumed. A slow link plus a chatty
+ * command therefore lost output silently -- no error anywhere, just missing
+ * text, which is the worst way for a remote shell to be wrong.
+ *
+ * So output is queued, and the Shell is made to WAIT rather than lied to. Once
+ * the queue passes the high-water mark this session stops taking packets off
+ * its console port at all, and the Shell's next write simply sits there
+ * unanswered -- which is exactly what a full pipe does to a process on Unix.
+ * Back-pressure, using the machinery that was already there.
+ */
+#define OUTBUF_SIZE    32768
+#define OUTBUF_HIWATER  8192
+
+/* Last resort when a single write is too big to queue: how long to wait for
+ * the socket rather than drop it. Bounded, because every other session is
+ * stopped meanwhile. */
+#define OUT_STALL_SECS     2
 
 /*
  * Consoles outlive their sessions, so there has to be somewhere to put them.
@@ -130,8 +166,26 @@ static int allow_no_auth = 0;
  */
 #define SESSION_IDLE_SECS 300
 
-/* Time to complete a login. Matches the usual telnetd/login convention. */
+/*
+ * Time to complete a login, as an ABSOLUTE deadline from the moment of
+ * connection. The old one was reset on every arriving byte, so it measured
+ * inactivity instead -- and a client sending one character a minute could hold
+ * the login open forever. Matches the usual telnetd/login convention.
+ */
 #define LOGIN_TIMEOUT_SECS 60
+
+/* How long a refused or timed-out caller is kept alive so the reason reaches
+ * them before the socket closes. */
+#define BYE_LINGER_SECS     5
+
+/* Where a session is in its life. Only PHASE_SHELL has a Shell behind it. */
+enum SessionPhase
+{
+	PHASE_USER = 0,	/* collecting the username */
+	PHASE_PASS,	/* collecting the password */
+	PHASE_SHELL,	/* logged in: bytes belong to the Shell */
+	PHASE_BYE	/* refused; flushing the last message, then closing */
+};
 
 #define HANDLE_IN   1
 #define HANDLE_OUT  2
@@ -167,6 +221,11 @@ struct Session
 	int           peer_gone;
 	ULONG         drain_deadline;	/* 0 == not draining; see DRAIN_GRACE_SECS */
 
+	/* Bytes for the network that the socket has not taken yet. */
+	unsigned char out[OUTBUF_SIZE];
+	long          out_len;
+	long          out_pos;
+
 	struct MsgPort    *port;	/* the Shell's console */
 	struct MsgPort    *replyport;	/* the helper's exit notification */
 	struct SpawnMsg   *sm;
@@ -178,6 +237,16 @@ struct Session
 	/* Reads held because the socket had nothing yet. */
 	struct DosPacket  *deferred[MAX_DEFERRED];
 	long               ndef;
+
+	/* The login dialogue, which is a phase of this session rather than a
+	 * loop of its own. See the note above login_consume(). */
+	int    phase;
+	int    shell_started;
+	ULONG  login_deadline;
+	ULONG  bye_deadline;
+	char   login_user[64];
+	char   login_pass[128];
+	long   login_n;
 };
 
 #define MAX_SESSIONS 4
@@ -377,12 +446,107 @@ static void say_num(CONST_STRPTR prefix, LONG value)
 /* ------------------------------------------------------------------ */
 /* Callbacks: telnet <-> console                                       */
 
+/* Bytes queued and still owed to the socket. */
+static long net_pending(const struct Session *s)
+{
+	return s->out_len - s->out_pos;
+}
+
+/*
+ * Push what the socket will take. Never blocks, never reports failure: a
+ * refusal is indistinguishable from "would block" without errno, and the main
+ * loop is already watching for both -- writability brings us back here, and a
+ * genuinely dead peer shows up as recv() returning 0.
+ */
+static void net_flush(struct Session *s)
+{
+	if (s->sock < 0)
+		return;
+
+	while (s->out_pos < s->out_len)
+	{
+		LONG n = send(s->sock, (APTR)(s->out + s->out_pos),
+		              s->out_len - s->out_pos, 0);
+		if (n <= 0)
+			break;
+		s->out_pos += n;
+	}
+
+	if (s->out_pos >= s->out_len)
+		s->out_len = s->out_pos = 0;
+	else if (s->out_pos > 0)
+	{
+		memmove(s->out, s->out + s->out_pos, s->out_len - s->out_pos);
+		s->out_len -= s->out_pos;
+		s->out_pos  = 0;
+	}
+}
+
+/*
+ * Make room for an oversized write.
+ *
+ * Only reachable when one ACTION_WRITE is larger than the whole queue, which
+ * the high-water mark makes rare -- but "rare" is not "never", and a program
+ * may Write() any size it likes. Waiting a bounded moment for the socket is
+ * better than dropping the data; the cap exists because every other session is
+ * stopped while we do it.
+ */
+static int net_stall(struct Session *s)
+{
+	ULONG deadline = now_secs() + OUT_STALL_SECS;
+
+	while (net_pending(s) > 0 && now_secs() <= deadline)
+	{
+		fd_set wr;
+		struct timeval tv;
+		LONG sigs = 0;
+
+		FD_ZERO(&wr);
+		FD_SET(s->sock, &wr);
+		tv.tv_sec = 1; tv.tv_usec = 0;
+
+		if (WaitSelect(s->sock + 1, NULL, &wr, NULL, &tv, (ULONG *)&sigs) < 0)
+			break;
+		net_flush(s);
+	}
+
+	return net_pending(s) < OUTBUF_SIZE;
+}
+
 static void net_out(void *ctx, const unsigned char *buf, long len)
 {
 	struct Session *s = (struct Session *)ctx;
 
-	if (s->sock >= 0 && len > 0)
-		send(s->sock, (APTR)buf, len, 0);
+	if (s->sock < 0 || len <= 0)
+		return;
+
+	while (len > 0)
+	{
+		long room = OUTBUF_SIZE - s->out_len;
+		long n;
+
+		if (room <= 0)
+		{
+			net_flush(s);
+			room = OUTBUF_SIZE - s->out_len;
+			if (room <= 0 && !net_stall(s))
+			{
+				/* Say so. Silent loss is the fault being fixed;
+				 * loud loss is at least explicable. */
+				say("telnetd: output queue full -- DROPPING shell output\n");
+				return;
+			}
+			continue;
+		}
+
+		n = (len < room) ? len : room;
+		CopyMem((APTR)buf, s->out + s->out_len, n);
+		s->out_len += n;
+		buf += n;
+		len -= n;
+	}
+
+	net_flush(s);
 }
 
 static void net_size(void *ctx, long rows, long cols)
@@ -433,120 +597,88 @@ static void net_write_str(struct Session *s, CONST_STRPTR text)
 	telnet_output(&s->tn, (const unsigned char *)text, (long)strlen((const char *)text));
 }
 
+/* ------------------------------------------------------------------ */
+/* The login dialogue, as a phase of the session                        */
+
 /*
- * Read one line from the client, with a deadline.
+ * This used to be a loop of its own, called straight from the accept path,
+ * with its own WaitSelect() on the one socket it cared about.
  *
- * `echo` false is used for the password: we told the client WILL ECHO, so it
- * sends us characters and expects US to echo them. Simply not echoing is what
- * hides the password -- there is no separate "turn off echo" needed, because we
- * were never not in control of it.
+ * While it ran, NOTHING ELSE WAS SERVICED -- not another session's socket, not
+ * a console port, not a new connection. Every established session's Shell sat
+ * on packets nobody was there to answer. And the deadline was reset on each
+ * arriving byte, so it timed inactivity rather than the login: one client
+ * sending a character every 59 seconds could hold the whole daemon still for
+ * as long as it liked. A program whose entire selling point is multiplexing
+ * had a one-connection denial of service in its front door.
+ *
+ * So it is a state machine now, fed from the main loop as bytes arrive, with
+ * an absolute deadline fixed when the caller connects.
  */
-static int read_line(struct Session *s, char *out, long max, int echo, LONG secs)
+
+static int  session_launch_shell(struct Session *s);
+
+static void session_bye(struct Session *s, CONST_STRPTR why)
 {
-	long n = 0;
+	if (why)
+		net_write_str(s, why);
+	s->phase        = PHASE_BYE;
+	s->bye_deadline = now_secs() + BYE_LINGER_SECS;
+	net_flush(s);
+}
 
-	out[0] = '\0';
-
-	for (;;)
-	{
-		fd_set rd;
-		struct timeval tv;
-		LONG sigs = SIGBREAKF_CTRL_C;
-		unsigned char raw[256], clean[256];
-		LONG got, i, cnt;
-
-		FD_ZERO(&rd);
-		FD_SET(s->sock, &rd);
-		tv.tv_sec = secs; tv.tv_usec = 0;
-
-		if (WaitSelect(s->sock + 1, &rd, NULL, NULL, &tv, (ULONG *)&sigs) <= 0)
-			return 0;	/* timed out, or interrupted */
-		if (sigs & SIGBREAKF_CTRL_C)
-			return 0;
-		if (!FD_ISSET(s->sock, &rd))
-			continue;
-
-		got = recv(s->sock, raw, sizeof(raw), 0);
-		if (got <= 0)
-			return 0;	/* hung up mid-login */
-
-		cnt = telnet_input(&s->tn, raw, got, clean, sizeof(clean));
-
-		for (i = 0; i < cnt; i++)
-		{
-			unsigned char c = clean[i];
-
-			if (c == '\r' || c == '\n')
-			{
-				if (n == 0 && c == '\n')
-					continue;	/* bare LF after CR */
-				out[n] = '\0';
-				net_write_str(s, (CONST_STRPTR)"\r\n");
-				return 1;
-			}
-			if (c == 8 || c == 127)		/* backspace / delete */
-			{
-				if (n > 0)
-				{
-					n--;
-					if (echo)
-						net_write_str(s, (CONST_STRPTR)"\b \b");
-				}
-				continue;
-			}
-			if (c < 32 || c > 126)
-				continue;		/* ignore control bytes */
-
-			if (n < max - 1)
-			{
-				out[n++] = (char)c;
-				if (echo)
-					telnet_output(&s->tn, &c, 1);
-			}
-		}
-	}
+static void session_login_timeout(struct Session *s)
+{
+	say("telnetd: login timed out\n");
+	session_bye(s, (CONST_STRPTR)"\r\nLogin timed out.\r\n");
 }
 
 /*
- * Authenticate, using the system's own user database.
+ * Forget the credential everywhere it has been.
  *
- * The daemon never stores a credential: getpwnam() gives us a salted hash,
- * ug_GetSalt() gives us its salt, and crypt() turns what was typed into
- * something comparable. The typed password lives only in a stack buffer, which
- * is wiped before returning.
+ * The typed password reaches two places -- the field, and the decoded input
+ * buffer it arrived in -- and wiping only the obvious one leaves it legible in
+ * the other. Only the part of the buffer the login CONSUMED is wiped: anything
+ * after it was typed for the Shell, and a client that sends its first command
+ * in the same segment as its password must not lose it.
  */
-static int authenticate(struct Session *s)
+static void login_forget(struct Session *s)
 {
-	char user[64], pass[128];
+	long i;
+
+	for (i = 0; i < (long)sizeof(s->login_pass); i++)
+		s->login_pass[i] = 0;
+	for (i = 0; i < s->in_pos && i < INBUF_SIZE; i++)
+		s->in[i] = 0;
+}
+
+/* Everything, for a slot about to be handed to somebody else. */
+static void login_forget_all(struct Session *s)
+{
+	long i;
+
+	for (i = 0; i < (long)sizeof(s->login_pass); i++)
+		s->login_pass[i] = 0;
+	for (i = 0; i < (long)sizeof(s->login_user); i++)
+		s->login_user[i] = 0;
+	for (i = 0; i < INBUF_SIZE; i++)
+		s->in[i] = 0;
+	s->in_len = s->in_pos = 0;
+}
+
+/*
+ * Decide, using the system's own user database.
+ *
+ * The daemon never stores a credential: getpwnam() gives us a salted hash and
+ * crypt() turns what was typed into something comparable.
+ */
+static void login_finish(struct Session *s)
+{
 	struct passwd *pw;
 	char salt[64];
 	enum AuthResult res;
-	int i;
 
-	if (allow_no_auth)
-	{
-		say("telnetd: WARNING -- authentication bypassed (-allow-no-auth)\n");
-		net_write_str(s, (CONST_STRPTR)
-			"\r\n*** WARNING: this telnetd is running with authentication DISABLED ***\r\n\r\n");
-		return 1;
-	}
-
-	if (UserGroupBase == NULL)
-	{
-		say("telnetd: usergroup.library unavailable; refusing all logins\n");
-		net_write_str(s, (CONST_STRPTR)"Authentication unavailable.\r\n");
-		return 0;
-	}
-
-	net_write_str(s, (CONST_STRPTR)"\r\nMorphOS telnetd\r\n\r\nlogin: ");
-	if (!read_line(s, user, (long)sizeof(user), 1, LOGIN_TIMEOUT_SECS) || user[0] == '\0')
-		return 0;
-
-	net_write_str(s, (CONST_STRPTR)"password: ");
-	if (!read_line(s, pass, (long)sizeof(pass), 0, LOGIN_TIMEOUT_SECS))
-		return 0;
-
-	pw = getpwnam((STRPTR)user);
+	pw = getpwnam((STRPTR)s->login_user);
 	salt[0] = '\0';
 	if (pw != NULL)
 	{
@@ -578,17 +710,16 @@ static int authenticate(struct Session *s)
 		                    : (const char *)salt;
 
 		res = auth_policy(pw ? pw->pw_passwd : NULL,
-		                  (pw && pass[0])
-		                      ? (const char *)crypt((STRPTR)pass, (STRPTR)saltp)
+		                  (pw && s->login_pass[0])
+		                      ? (const char *)crypt((STRPTR)s->login_pass,
+		                                            (STRPTR)saltp)
 		                      : NULL);
 	}
 
-	/* Wipe the typed password as soon as it has been hashed. */
-	for (i = 0; i < (int)sizeof(pass); i++)
-		pass[i] = 0;
+	login_forget(s);
 
 	say("telnetd: login '");
-	say((CONST_STRPTR)user);
+	say((CONST_STRPTR)s->login_user);
 	say("' -> ");
 	say((CONST_STRPTR)auth_result_name(res));
 	say("\n");
@@ -597,12 +728,88 @@ static int authenticate(struct Session *s)
 	{
 		/* One message for every failure: never tell a stranger whether
 		 * the account exists or merely has no password. */
-		net_write_str(s, (CONST_STRPTR)"\r\nLogin incorrect.\r\n");
-		return 0;
+		session_bye(s, (CONST_STRPTR)"\r\nLogin incorrect.\r\n");
+		return;
 	}
 
 	net_write_str(s, (CONST_STRPTR)"\r\n");
-	return 1;
+	if (!session_launch_shell(s))
+		session_bye(s, (CONST_STRPTR)
+			"\r\ntelnetd: could not create a console for this session.\r\n");
+}
+
+/*
+ * Consume as much of the decoded input as belongs to the login.
+ *
+ * Whatever is left after the password's newline stays in the buffer for the
+ * Shell. That matters: a client that sends both lines in one segment -- which
+ * an automated caller does as a matter of course -- used to have everything
+ * after the first CR thrown away, so its password never arrived at all.
+ *
+ * We told the client WILL ECHO, so hiding the password is simply a matter of
+ * not echoing it. There is no mode to switch; we were always the one echoing.
+ */
+static void login_consume(struct Session *s)
+{
+	while (s->in_pos < s->in_len
+	       && (s->phase == PHASE_USER || s->phase == PHASE_PASS))
+	{
+		int   user  = (s->phase == PHASE_USER);
+		char *field = user ? s->login_user : s->login_pass;
+		long  max   = user ? (long)sizeof(s->login_user)
+		                   : (long)sizeof(s->login_pass);
+		unsigned char c = s->in[s->in_pos++];
+
+		if (c == '\r' || c == '\n')
+		{
+			field[s->login_n] = '\0';
+			s->login_n = 0;
+			net_write_str(s, (CONST_STRPTR)"\r\n");
+
+			if (user)
+			{
+				if (field[0] == '\0')
+				{
+					/* Nothing typed: ask again rather than
+					 * spend the attempt. The deadline still
+					 * bounds this. */
+					net_write_str(s, (CONST_STRPTR)"login: ");
+					continue;
+				}
+				s->phase = PHASE_PASS;
+				net_write_str(s, (CONST_STRPTR)"password: ");
+			}
+			else
+			{
+				login_finish(s);
+			}
+			continue;
+		}
+
+		if (c == 8 || c == 127)			/* backspace / delete */
+		{
+			if (s->login_n > 0)
+			{
+				s->login_n--;
+				if (user)
+					net_write_str(s, (CONST_STRPTR)"\b \b");
+			}
+			continue;
+		}
+
+		if (c < 32 || c > 126)
+			continue;			/* ignore control bytes */
+
+		if (s->login_n < max - 1)
+		{
+			field[s->login_n++] = (char)c;
+			if (user)
+				telnet_output(&s->tn, &c, 1);
+		}
+	}
+
+	if (s->in_pos >= s->in_len)
+		s->in_len = s->in_pos = 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -814,7 +1021,9 @@ static void session_end(struct Session *s)
 	 * the memory stays valid and stays ours either way.
 	 * Not finished: a reaper keeps answering it until the Shell lets go.
 	 */
-	if (s->helper_done && console_session_finished(&s->con))
+	if (!s->shell_started)
+		port_put(s->port);	/* no Shell was ever pointed at it */
+	else if (s->helper_done && console_session_finished(&s->con))
 		port_put(s->port);
 	else if (!reaper_adopt(s))
 		say("telnetd: no reaper free -- abandoning a console port\n");
@@ -827,6 +1036,10 @@ static void session_end(struct Session *s)
 	}
 	s->replyport = NULL;
 	s->sm = NULL;
+
+	/* The slot is reused, so nothing of this caller may be left legible in
+	 * it for the next one. */
+	login_forget_all(s);
 
 	if (s->sock >= 0)
 		CloseSocket(s->sock);
@@ -850,11 +1063,25 @@ static void session_end(struct Session *s)
  */
 static int session_finished(struct Session *s)
 {
+	if (!s->shell_started)
+	{
+		/* Nothing was ever spawned on this caller's behalf, so there is
+		 * nothing to wind down -- only our own last words to get out. */
+		if (s->peer_gone)
+			return 1;
+		if (s->phase == PHASE_BYE)
+			return net_pending(s) == 0 || now_secs() >= s->bye_deadline;
+		return 0;
+	}
+
 	return s->helper_done && console_session_finished(&s->con);
 }
 
 static int session_expired(struct Session *s)
 {
+	if (!s->shell_started)
+		return 0;	/* bounded by the login deadline instead */
+
 	return s->peer_gone
 	    && s->drain_deadline != 0
 	    && now_secs() >= s->drain_deadline;
@@ -862,13 +1089,14 @@ static int session_expired(struct Session *s)
 
 static int session_start(struct Session *s, LONG sock, LONG session_no)
 {
-	struct TagItem proctags[6];
 	LONG yes = 1;
 
 	memset(s, 0, sizeof(*s));
 	s->in_use = 1;
 	s->sock   = sock;
 	s->ndef   = 0;
+	s->phase  = PHASE_USER;
+	s->login_deadline = now_secs() + LOGIN_TIMEOUT_SECS;
 
 	/*
 	 * A device name unique to this DAEMON as well as this session.
@@ -914,71 +1142,45 @@ static int session_start(struct Session *s, LONG sock, LONG session_no)
 		goto fail;
 	}
 
-	/* The telnet layer must exist before authentication: the login dialogue
-	 * is carried over it. */
+	/*
+	 * Non-blocking from the very first byte.
+	 *
+	 * This used to be switched on after the login, because the login had a
+	 * blocking loop of its own. It does not any more, and nothing this
+	 * socket does may make the other sessions wait.
+	 */
+	IoctlSocket(s->sock, TD_FIONBIO, (APTR)&yes);
+
+	/* The telnet layer must exist before the login: the dialogue is carried
+	 * over it, and the password is hidden by our own choice not to echo. */
 	telnet_init(&s->tn, net_out, net_size, s);
 	console_init(&s->con, shell_read, shell_write, s, 2, 0);
 	telnet_start(&s->tn);
 
-	if (!authenticate(s))
+	if (allow_no_auth)
 	{
-		say("telnetd: login failed; closing\n");
-		goto fail;
+		say("telnetd: WARNING -- authentication bypassed (-a)\n");
+		net_write_str(s, (CONST_STRPTR)
+			"\r\n*** WARNING: this telnetd is running with authentication DISABLED ***\r\n\r\n");
+		if (!session_launch_shell(s))
+			session_bye(s, (CONST_STRPTR)
+				"\r\ntelnetd: could not create a console for this session.\r\n");
+		return 1;
 	}
 
-	s->devnode = MakeDosEntry((CONST_STRPTR)s->mount_name, DLT_DEVICE);
-	if (s->devnode == NULL) { say("telnetd: MakeDosEntry failed\n"); goto fail; }
-	s->devnode->dol_Task = s->port;
-	if (!AddDosEntry(s->devnode))
+	if (UserGroupBase == NULL)
 	{
-		/* Tell the client. A connection that is accepted and then
-		 * silently dropped is the worst outcome available -- the caller
-		 * cannot tell it from a hang. */
-		static const char clash[] =
-			"\r\ntelnetd: could not create a console for this session.\r\n";
-		say("telnetd: mount name already in use: ");
-		say((CONST_STRPTR)s->mount_name);
-		say("\n");
-		send(s->sock, (APTR)clash, (LONG)sizeof(clash) - 1, 0);
-		FreeDosEntry(s->devnode);
-		s->devnode = NULL;
-		goto fail;
+		say("telnetd: usergroup.library unavailable; refusing all logins\n");
+		session_bye(s, (CONST_STRPTR)"\r\nAuthentication unavailable.\r\n");
+		return 1;
 	}
 
-	s->sm->msg.mn_Node.ln_Type = NT_MESSAGE;
-	s->sm->msg.mn_ReplyPort    = s->replyport;
-	s->sm->msg.mn_Length       = sizeof(struct SpawnMsg);
-	s->sm->input               = MKBADDR(s->fh_in);
-	s->sm->output              = MKBADDR(s->fh_out);
-	s->sm->console_port        = (APTR)s->port;
-
-	{
-		char *d = s->sm->command_buf;
-		const char *p1 = "NewShell ";
-		while (*p1) *d++ = *p1++;
-		p1 = s->mount_name;
-		while (*p1) *d++ = *p1++;
-		*d++ = ':'; *d = '\0';
-	}
-
-	IoctlSocket(s->sock, TD_FIONBIO, (APTR)&yes);
-
-	proctags[0].ti_Tag = NP_CodeType;   proctags[0].ti_Data = CODETYPE_PPC;
-	proctags[1].ti_Tag = NP_Entry;      proctags[1].ti_Data = (IPTR)spawn_helper;
-	proctags[2].ti_Tag = NP_StartupMsg; proctags[2].ti_Data = (IPTR)s->sm;
-	proctags[3].ti_Tag = NP_Name;       proctags[3].ti_Data = (IPTR)"telnetd session";
-	proctags[4].ti_Tag = NP_WindowPtr;  proctags[4].ti_Data = (IPTR)-1;
-	proctags[5].ti_Tag = TAG_DONE;      proctags[5].ti_Data = 0;
-
-	if (CreateNewProc(proctags) == NULL)
-	{
-		say("telnetd: could not start the shell\n");
-		goto fail;
-	}
-
-	say("telnetd: session on ");
-	say((CONST_STRPTR)s->mount_name);
-	say(":\n");
+	/*
+	 * From here the main loop drives it. The caller is accepted -- it has a
+	 * slot and a deadline -- but nothing is spawned on its behalf until it
+	 * has proved who it is.
+	 */
+	net_write_str(s, (CONST_STRPTR)"\r\nMorphOS telnetd\r\n\r\nlogin: ");
 	return 1;
 
 fail:
@@ -1004,14 +1206,108 @@ fail:
 	return 0;
 }
 
+/*
+ * Everything that only happens once a caller has proved who it is.
+ *
+ * Kept apart from session_start() on purpose: until this runs, no Shell exists,
+ * no device name is published, and nothing but a socket and a message port has
+ * been spent on whoever is calling. A failed login therefore costs an
+ * unauthenticated stranger almost nothing of ours.
+ */
+static int session_launch_shell(struct Session *s)
+{
+	struct TagItem proctags[6];
+
+	s->devnode = MakeDosEntry((CONST_STRPTR)s->mount_name, DLT_DEVICE);
+	if (s->devnode == NULL)
+	{
+		say("telnetd: MakeDosEntry failed\n");
+		return 0;
+	}
+	s->devnode->dol_Task = s->port;
+
+	if (!AddDosEntry(s->devnode))
+	{
+		say("telnetd: mount name already in use: ");
+		say((CONST_STRPTR)s->mount_name);
+		say("\n");
+		FreeDosEntry(s->devnode);
+		s->devnode = NULL;
+		return 0;
+	}
+
+	s->sm->msg.mn_Node.ln_Type = NT_MESSAGE;
+	s->sm->msg.mn_ReplyPort    = s->replyport;
+	s->sm->msg.mn_Length       = sizeof(struct SpawnMsg);
+	s->sm->input               = MKBADDR(s->fh_in);
+	s->sm->output              = MKBADDR(s->fh_out);
+	s->sm->console_port        = (APTR)s->port;
+
+	{
+		char *d = s->sm->command_buf;
+		const char *p1 = "NewShell ";
+		while (*p1) *d++ = *p1++;
+		p1 = s->mount_name;
+		while (*p1) *d++ = *p1++;
+		*d++ = ':'; *d = '\0';
+	}
+
+	proctags[0].ti_Tag = NP_CodeType;   proctags[0].ti_Data = CODETYPE_PPC;
+	proctags[1].ti_Tag = NP_Entry;      proctags[1].ti_Data = (IPTR)spawn_helper;
+	proctags[2].ti_Tag = NP_StartupMsg; proctags[2].ti_Data = (IPTR)s->sm;
+	proctags[3].ti_Tag = NP_Name;       proctags[3].ti_Data = (IPTR)"telnetd session";
+	proctags[4].ti_Tag = NP_WindowPtr;  proctags[4].ti_Data = (IPTR)-1;
+	proctags[5].ti_Tag = TAG_DONE;      proctags[5].ti_Data = 0;
+
+	if (CreateNewProc(proctags) == NULL)
+	{
+		say("telnetd: could not start the shell\n");
+		if (RemDosEntry(s->devnode))
+			FreeDosEntry(s->devnode);
+		s->devnode = NULL;
+		return 0;
+	}
+
+	s->shell_started = 1;
+	s->phase         = PHASE_SHELL;
+
+	say("telnetd: session on ");
+	say((CONST_STRPTR)s->mount_name);
+	say(":\n");
+	return 1;
+}
+
 /* One slice of work: whatever this session can do without blocking. */
-static void session_service(struct Session *s, int readable)
+static void session_service(struct Session *s, int readable, int writable)
 {
 	long i;
+
+	if (writable)
+		net_flush(s);
+
+	/*
+	 * Reclaim what the Shell has already read. Without this the buffer
+	 * only ever emptied when it emptied COMPLETELY, so a session that was
+	 * never quite drained filled up and then discarded everything typed
+	 * after that -- silently, since telnet_input honours out_max and simply
+	 * parses the overflow away.
+	 */
+	if (s->in_pos > 0)
+	{
+		if (s->in_pos < s->in_len)
+		{
+			memmove(s->in, s->in + s->in_pos, s->in_len - s->in_pos);
+			s->in_len -= s->in_pos;
+		}
+		else
+			s->in_len = 0;
+		s->in_pos = 0;
+	}
 
 	if (s->sock >= 0 && readable)
 	{
 		unsigned char raw[1024];
+		int  secret = (s->phase == PHASE_PASS || s->phase == PHASE_USER);
 		LONG got = recv(s->sock, raw, sizeof(raw), 0);
 
 		if (got > 0)
@@ -1019,6 +1315,16 @@ static void session_service(struct Session *s, int readable)
 			long room = INBUF_SIZE - s->in_len;
 			long n = telnet_input(&s->tn, raw, got, s->in + s->in_len, room);
 			s->in_len += n;
+			if (s->phase != PHASE_SHELL)
+				login_consume(s);
+		}
+
+		/* This held the password on its way past. */
+		if (secret)
+		{
+			LONG k;
+			for (k = 0; k < (LONG)sizeof(raw); k++)
+				raw[k] = 0;
 		}
 		else if (got == 0)
 		{
@@ -1027,7 +1333,26 @@ static void session_service(struct Session *s, int readable)
 			console_begin_drain(&s->con);
 			say("telnetd: peer closed; draining\n");
 		}
-		/* got < 0 is EWOULDBLOCK on a non-blocking socket, not a hangup. */
+		else
+		{
+			/*
+			 * -1 is USUALLY just an empty non-blocking socket, and
+			 * treating that as a hangup ended live sessions. But it
+			 * is not always: a reset connection reports readable
+			 * forever and fails every recv(), so taking every -1 for
+			 * "nothing yet" spun this loop at full speed until the
+			 * Shell happened to exit. Ask which it was.
+			 */
+			LONG e = Errno();
+
+			if (e != TD_EWOULDBLOCK && e != TD_EINTR)
+			{
+				s->peer_gone      = 1;
+				s->drain_deadline = now_secs() + DRAIN_GRACE_SECS;
+				console_begin_drain(&s->con);
+				say_num("telnetd: peer reset; draining, errno = ", e);
+			}
+		}
 	}
 
 	/* Reads held back because the socket had nothing to give them. */
@@ -1043,13 +1368,22 @@ static void session_service(struct Session *s, int readable)
 		s->deferred[i] = s->deferred[--s->ndef];
 	}
 
-	service_port(s->port, &s->con, s->deferred, &s->ndef, MAX_DEFERRED);
+	/*
+	 * Take packets only while there is somewhere to put the answers. Over
+	 * the high-water mark the Shell's writes stay queued on the port,
+	 * unanswered, and it blocks in WaitPort until the socket catches up --
+	 * which is the whole point: back-pressure instead of discarded output.
+	 */
+	if (net_pending(s) < OUTBUF_HIWATER)
+		service_port(s->port, &s->con, s->deferred, &s->ndef, MAX_DEFERRED);
 
 	while (GetMsg(s->replyport) != NULL)
 	{
 		s->helper_done = 1;
 		say_num("telnetd: helper finished, SystemTagList rc = ", s->sm->rc);
 	}
+
+	net_flush(s);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1366,13 +1700,14 @@ static void daemon_main(void)
 	 */
 	for (;;)
 	{
-		fd_set rd;
+		fd_set rd, wr;
 		struct timeval tv;
 		LONG sigs = SIGBREAKF_CTRL_C;
 		LONG nready, maxfd = listener;
-		int active = 0, winding_down = 0;
+		int active = 0, deadline_pending = 0;
 
 		FD_ZERO(&rd);
+		FD_ZERO(&wr);
 		FD_SET(listener, &rd);
 
 		for (i = 0; i < MAX_SESSIONS; i++)
@@ -1381,12 +1716,23 @@ static void daemon_main(void)
 			if (!s->in_use)
 				continue;
 			active++;
-			if (s->sock >= 0 && !s->peer_gone)
+			if (s->sock >= 0)
 			{
-				FD_SET(s->sock, &rd);
+				/* Stop reading when there is nowhere to put it.
+				 * TCP then does the flow control for us, rather
+				 * than us parsing bytes and dropping them. */
+				if (!s->peer_gone && s->in_len < INBUF_SIZE)
+					FD_SET(s->sock, &rd);
+				if (net_pending(s) > 0)
+					FD_SET(s->sock, &wr);
 				if (s->sock > maxfd) maxfd = s->sock;
 			}
-			if (s->peer_gone) winding_down++;
+			/* Anything with a deadline on it -- a login not yet
+			 * completed, a drain not yet finished -- needs the wait
+			 * kept short enough to reach that deadline. Queued
+			 * output does not: the write set already wakes us. */
+			if (!s->shell_started || s->peer_gone)
+				deadline_pending++;
 			if (s->port)      sigs |= (1UL << s->port->mp_SigBit);
 			if (s->replyport) sigs |= (1UL << s->replyport->mp_SigBit);
 		}
@@ -1395,7 +1741,7 @@ static void daemon_main(void)
 		{
 			if (!reapers[i].in_use || reapers[i].port == NULL)
 				continue;
-			winding_down++;
+			deadline_pending++;
 			sigs |= (1UL << reapers[i].port->mp_SigBit);
 		}
 
@@ -1404,13 +1750,13 @@ static void daemon_main(void)
 		 * down, in which case a deadline has to be checked and the wait
 		 * has to be short enough to reach it.
 		 */
-		if (winding_down)
+		if (deadline_pending)
 			tv.tv_sec = 1;
 		else
 			tv.tv_sec = wait_secs > 0 ? wait_secs : 3600;
 		tv.tv_usec = 0;
 
-		nready = WaitSelect(maxfd + 1, &rd, NULL, NULL, &tv, (ULONG *)&sigs);
+		nready = WaitSelect(maxfd + 1, &rd, &wr, NULL, &tv, (ULONG *)&sigs);
 
 		if (sigs & SIGBREAKF_CTRL_C)
 		{
@@ -1424,8 +1770,16 @@ static void daemon_main(void)
 			struct Session *s = &sessions[i];
 			if (!s->in_use)
 				continue;
-			session_service(s, (nready > 0 && s->sock >= 0
-			                    && FD_ISSET(s->sock, &rd)));
+			if (!s->shell_started && s->phase != PHASE_BYE
+			    && now_secs() >= s->login_deadline)
+				session_login_timeout(s);
+
+			session_service(s,
+			                (nready > 0 && s->sock >= 0
+			                 && FD_ISSET(s->sock, &rd)),
+			                (nready > 0 && s->sock >= 0
+			                 && FD_ISSET(s->sock, &wr)));
+
 			if (session_finished(s)
 			    || (session_expired(s) && reaper_available()))
 				session_end(s);
@@ -1469,7 +1823,7 @@ static void daemon_main(void)
 			continue;
 		}
 
-		if (nready == 0 && active == 0 && winding_down == 0 && wait_secs > 0)
+		if (nready == 0 && active == 0 && deadline_pending == 0 && wait_secs > 0)
 		{
 			say("telnetd: no connection within the timeout; exiting\n");
 			break;
