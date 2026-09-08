@@ -146,11 +146,51 @@ struct Session
 #define MAX_SESSIONS 4
 static struct Session sessions[MAX_SESSIONS];
 
+/*
+ * READY HANDSHAKE.
+ *
+ * -d used to report success on the strength of having forked. The child then
+ * discovered it could not bind and had nowhere to say so, because the parent
+ * had already exited announcing victory -- so starting on an occupied port gave
+ * rc=0, a log file, a live process, and a port answering from somebody else's
+ * daemon, with a supervisor going green over it.
+ *
+ * The parent therefore waits to be TOLD the child is listening. The channel is
+ * a port the PARENT creates and names, passed to the child on its command line.
+ *
+ * It is deliberately not a well-known name derived from the TCP port. MorphOS
+ * reclaims nothing at exit, so a daemon that crashes -- or is Break-ed while
+ * wedged, both of which happened here -- would leave a public port behind with
+ * nothing running. Anything treating that name as "a daemon is running" would
+ * then refuse to start for a reason that is no longer true, and only a reboot
+ * would clear it. A per-launch name cannot go stale: it lives exactly as long
+ * as the parent that is waiting on it.
+ *
+ * bind() remains the only authority on whether a port is free. This says only
+ * "a child of MINE reached listen()", which is a positive signal and never a
+ * negative one.
+ */
+static void ready_portname(char *out, long max)
+{
+	static const char pfx[] = "telnetd-ready-";
+	ULONG v = (ULONG)FindTask(NULL);
+	int n = 0, i;
+
+	while (pfx[n] && n < max - 12) { out[n] = pfx[n]; n++; }
+	for (i = 28; i >= 0 && n < max - 1; i -= 4)
+	{
+		int d = (int)((v >> i) & 0xF);
+		out[n++] = (char)(d < 10 ? '0' + d : 'a' + d - 10);
+	}
+	out[n] = '\0';
+}
+
 /* Configuration, parsed once and read by the daemon process. */
 static LONG         cfg_port      = DEFAULT_PORT;
 static LONG         cfg_wait      = 0;
 static CONST_STRPTR cfg_bind      = NULL;
 static CONST_STRPTR cfg_logfile   = NULL;
+static CONST_STRPTR cfg_readyport = NULL;
 
 
 /* ------------------------------------------------------------------ */
@@ -811,6 +851,14 @@ static int detach(CONST_STRPTR self, int argc, char **argv)
 		cmd[n++] = ' ';
 		while (*a && n < (int)sizeof(cmd) - 2) cmd[n++] = *a++;
 	}
+	/* Tell the child where to report that it is listening. */
+	if (cfg_readyport)
+	{
+		const char *r = " -r ";
+		const char *a = (const char *)cfg_readyport;
+		while (*r && n < (int)sizeof(cmd) - 2) cmd[n++] = *r++;
+		while (*a && n < (int)sizeof(cmd) - 2) cmd[n++] = *a++;
+	}
 	cmd[n] = '\0';
 
 	nil_in  = Open((CONST_STRPTR)"NIL:", MODE_OLDFILE);
@@ -855,6 +903,10 @@ int main(int argc, char **argv)
 		{
 			detach_me = 1;
 		}
+		else if (argv[i][0] == '-' && argv[i][1] == 'r' && i + 1 < argc)
+		{
+			cfg_readyport = (CONST_STRPTR)argv[++i];
+		}
 		else if (argv[i][0] == '-' && argv[i][1] == 'l' && i + 1 < argc)
 		{
 			cfg_logfile = (CONST_STRPTR)argv[++i];
@@ -878,13 +930,56 @@ int main(int argc, char **argv)
 		                    ? (CONST_STRPTR)argv[0]
 		                    : (CONST_STRPTR)"telnetd";
 
+		char rname[40];
+		struct MsgPort *ready;
+		int waited, ok = 0;
+
+		ready_portname(rname, (long)sizeof(rname));
+
+		ready = CreateMsgPort();
+		if (ready == NULL)
+		{
+			say("telnetd: no message port for the ready handshake\n");
+			return RETURN_FAIL;
+		}
+		ready->mp_Node.ln_Name = rname;
+		ready->mp_Node.ln_Pri  = 0;
+		AddPort(ready);
+
+		cfg_readyport = (CONST_STRPTR)rname;
+
 		if (!detach(self, argc, argv))
 		{
 			say("telnetd: could not detach\n");
+			RemPort(ready);
+			DeleteMsgPort(ready);
 			return RETURN_FAIL;
 		}
-		say("telnetd: detached; running in the background\n");
-		return RETURN_OK;
+
+		/* Up to ten seconds for the child to reach listen(). */
+		for (waited = 0; waited < 50 && !ok; waited++)
+		{
+			Delay(10);	/* 1/5 second */
+			if (GetMsg(ready) != NULL)
+				ok = 1;
+		}
+
+		RemPort(ready);
+		DeleteMsgPort(ready);
+
+		if (ok)
+		{
+			say("telnetd: detached and listening\n");
+			return RETURN_OK;
+		}
+
+		/*
+		 * Distinct from a failure to create the process, so a supervisor
+		 * can tell "someone beat me to this port, stand down" from
+		 * "something is wrong, raise an alarm".
+		 */
+		say("telnetd: started but never began listening -- port already in use?\n");
+		return RETURN_ERROR;
 	}
 
 	daemon_main();
@@ -975,6 +1070,27 @@ static void daemon_main(void)
 		CloseSocket(listener);
 		CloseLibrary(SocketBase);
 		return;
+	}
+
+	/*
+	 * Tell the launcher we are up -- only now, with bind() and listen()
+	 * both behind us, so the signal means "serving" and not "started".
+	 */
+	if (cfg_readyport)
+	{
+		struct MsgPort *parent;
+
+		Forbid();
+		parent = FindPort(cfg_readyport);
+		if (parent)
+		{
+			static struct Message ready;
+			ready.mn_Node.ln_Type = NT_MESSAGE;
+			ready.mn_ReplyPort    = NULL;
+			ready.mn_Length       = sizeof(ready);
+			PutMsg(parent, &ready);
+		}
+		Permit();
 	}
 
 	say("telnetd: listening on ");
