@@ -112,8 +112,14 @@ struct SpawnMsg
 	char  command_buf[32];
 };
 
+/*
+ * A session, complete. Everything that used to live in run_session's locals is
+ * here, because a session is no longer serviced by a loop of its own: several
+ * are serviced in slices from one loop, so their state has to outlive any call.
+ */
 struct Session
 {
+	int                in_use;
 	LONG               sock;
 	struct TelnetState tn;
 	struct ConsoleState con;
@@ -123,7 +129,22 @@ struct Session
 	long          in_len;
 	long          in_pos;
 	int           peer_gone;
+
+	struct MsgPort    *port;	/* the Shell's console */
+	struct MsgPort    *replyport;	/* the helper's exit notification */
+	struct SpawnMsg   *sm;
+	struct FileHandle *fh_in, *fh_out;
+	struct DosList    *devnode;
+	char               mount_name[16];
+	int                helper_done;
+
+	/* Reads held because the socket had nothing yet. */
+	struct DosPacket  *deferred[MAX_DEFERRED];
+	long               ndef;
 };
+
+#define MAX_SESSIONS 4
+static struct Session sessions[MAX_SESSIONS];
 
 /* ------------------------------------------------------------------ */
 
@@ -349,7 +370,16 @@ static int authenticate(struct Session *s)
 	pw = getpwnam((STRPTR)user);
 	salt[0] = '\0';
 	if (pw != NULL)
+	{
+		/* The library knows the right salt for this entry's hash format;
+		 * choosing one ourselves would only work by accident. */
 		ug_GetSalt(pw, (STRPTR)salt, sizeof(salt));
+	}
+	else
+	{
+		LONG e = ug_GetErr();
+		say_num("telnetd: getpwnam failed, ug_GetErr = ", e);
+	}
 
 	res = auth_policy(pw ? pw->pw_passwd : NULL,
 	                  (pw && pass[0]) ? (const char *)crypt((STRPTR)pass, (STRPTR)salt)
@@ -427,93 +457,116 @@ static struct FileHandle *make_handle(struct MsgPort *port, LONG mode, LONG id)
 
 /* ------------------------------------------------------------------ */
 
-static void run_session(LONG sock, LONG session_no)
-{
-	char mount_name[16];
-	struct Session     *s;
-	struct MsgPort     *port = NULL, *replyport = NULL;
-	struct SpawnMsg    *sm = NULL;
-	struct FileHandle  *fh_in = NULL, *fh_out = NULL;
-	struct DosList     *devnode = NULL;
-	struct DosPacket   *deferred[MAX_DEFERRED];
-	long                ndef = 0;
-	struct TagItem      proctags[6];
-	int                 helper_done = 0;
-	LONG                yes = 1;
+/* ------------------------------------------------------------------ */
+/* A session is now started, serviced in slices, and ended -- rather than
+ * owning a blocking loop. That is what lets one process serve several at
+ * once, which matters because a second caller previously connected and then
+ * silently received nothing at all.                                    */
 
-	s = AllocVec(sizeof(struct Session), MEMF_PUBLIC | MEMF_CLEAR);
-	if (s == NULL) { say("telnetd: out of memory\n"); return; }
-	s->sock = sock;
+static void session_end(struct Session *s)
+{
+	/* Anything still held must be answered or the Shell waits forever. */
+	while (s->ndef > 0)
+		ReplyPkt(s->deferred[--s->ndef], 0, 0);
+
+	if (s->devnode && RemDosEntry(s->devnode))
+		FreeDosEntry(s->devnode);
+	s->devnode = NULL;
 
 	/*
-	 * A device name per session. Two sessions cannot share one, and a name
-	 * left behind by a session that died badly must not block the next
-	 * connection -- so they differ rather than collide.
+	 * The message port is deliberately NOT freed. Freeing one a Shell may
+	 * still hold a handle to takes down the OS rather than failing politely,
+	 * and the only thing that could vouch for it being safe is our own
+	 * packet accounting -- the code under test. A leaked port costs a few
+	 * hundred bytes until reboot; nothing is reclaimed at exit here anyway.
 	 */
+	if (s->helper_done)
+	{
+		if (s->replyport) DeleteMsgPort(s->replyport);
+		if (s->sm)        FreeVec(s->sm);
+	}
+	s->replyport = NULL;
+	s->sm = NULL;
+
+	if (s->sock >= 0)
+		CloseSocket(s->sock);
+	s->sock = -1;
+	s->in_use = 0;
+	say("telnetd: session ended\n");
+}
+
+/* True once there is nothing left to serve. */
+static int session_finished(struct Session *s)
+{
+	return s->helper_done
+	    && (console_session_finished(&s->con) || s->peer_gone);
+}
+
+static int session_start(struct Session *s, LONG sock, LONG session_no)
+{
+	struct TagItem proctags[6];
+	LONG yes = 1;
+
+	memset(s, 0, sizeof(*s));
+	s->in_use = 1;
+	s->sock   = sock;
+	s->ndef   = 0;
+
 	{
 		LONG v = session_no % 100;
-		mount_name[0] = 'T'; mount_name[1] = 'E'; mount_name[2] = 'L';
-		mount_name[3] = (char)('0' + (v / 10));
-		mount_name[4] = (char)('0' + (v % 10));
-		mount_name[5] = '\0';
+		s->mount_name[0] = 'T'; s->mount_name[1] = 'E'; s->mount_name[2] = 'L';
+		s->mount_name[3] = (char)('0' + (v / 10));
+		s->mount_name[4] = (char)('0' + (v % 10));
+		s->mount_name[5] = '\0';
 	}
 
-	port      = CreateMsgPort();
-	replyport = CreateMsgPort();
-	sm        = AllocVec(sizeof(struct SpawnMsg), MEMF_PUBLIC | MEMF_CLEAR);
-	fh_in     = port ? make_handle(port, MODE_OLDFILE, HANDLE_IN)  : NULL;
-	fh_out    = port ? make_handle(port, MODE_NEWFILE, HANDLE_OUT) : NULL;
+	s->port      = CreateMsgPort();
+	s->replyport = CreateMsgPort();
+	s->sm        = AllocVec(sizeof(struct SpawnMsg), MEMF_PUBLIC | MEMF_CLEAR);
+	s->fh_in     = s->port ? make_handle(s->port, MODE_OLDFILE,  HANDLE_IN)  : NULL;
+	s->fh_out    = s->port ? make_handle(s->port, MODE_NEWFILE, HANDLE_OUT) : NULL;
 
-	if (!port || !replyport || !sm || !fh_in || !fh_out)
+	if (!s->port || !s->replyport || !s->sm || !s->fh_in || !s->fh_out)
 	{
 		say("telnetd: session setup failed\n");
-		goto cleanup_early;
+		goto fail;
 	}
 
-	/*
-	 * The telnet layer must exist BEFORE authentication: the login dialogue
-	 * is carried over it, and until telnet_init() runs, out_fn is NULL and
-	 * every prompt goes nowhere. That ordering bug was invisible while the
-	 * development bypass was in use, because the bypass returns before any
-	 * prompt is written -- the working path could not exercise the broken
-	 * one. With auth enabled the client would simply have sat there.
-	 */
+	/* The telnet layer must exist before authentication: the login dialogue
+	 * is carried over it. */
 	telnet_init(&s->tn, net_out, net_size, s);
 	console_init(&s->con, shell_read, shell_write, s, 2, 0);
 	telnet_start(&s->tn);
 
-	/* Authenticate BEFORE anything else exists. A failed login must not have
-	 * caused a device to be mounted or a Shell to be spawned. */
 	if (!authenticate(s))
 	{
 		say("telnetd: login failed; closing\n");
-		goto cleanup_early;
+		goto fail;
 	}
 
-	devnode = MakeDosEntry((CONST_STRPTR)mount_name, DLT_DEVICE);
-	if (devnode == NULL) { say("telnetd: MakeDosEntry failed\n"); goto cleanup_early; }
-	devnode->dol_Task = port;
-	if (!AddDosEntry(devnode))
+	s->devnode = MakeDosEntry((CONST_STRPTR)s->mount_name, DLT_DEVICE);
+	if (s->devnode == NULL) { say("telnetd: MakeDosEntry failed\n"); goto fail; }
+	s->devnode->dol_Task = s->port;
+	if (!AddDosEntry(s->devnode))
 	{
 		say("telnetd: mount name already in use\n");
-		FreeDosEntry(devnode); devnode = NULL;
-		goto cleanup_early;
+		FreeDosEntry(s->devnode);
+		s->devnode = NULL;
+		goto fail;
 	}
 
+	s->sm->msg.mn_Node.ln_Type = NT_MESSAGE;
+	s->sm->msg.mn_ReplyPort    = s->replyport;
+	s->sm->msg.mn_Length       = sizeof(struct SpawnMsg);
+	s->sm->input               = MKBADDR(s->fh_in);
+	s->sm->output              = MKBADDR(s->fh_out);
+	s->sm->console_port        = (APTR)s->port;
 
-	sm->msg.mn_Node.ln_Type = NT_MESSAGE;
-	sm->msg.mn_ReplyPort    = replyport;
-	sm->msg.mn_Length       = sizeof(struct SpawnMsg);
-	sm->input               = MKBADDR(fh_in);
-	sm->output              = MKBADDR(fh_out);
-	sm->console_port        = (APTR)port;
-
-	/* "NewShell TELnn:" -- built here because the device name varies. */
 	{
-		char *d = sm->command_buf;
+		char *d = s->sm->command_buf;
 		const char *p1 = "NewShell ";
 		while (*p1) *d++ = *p1++;
-		p1 = mount_name;
+		p1 = s->mount_name;
 		while (*p1) *d++ = *p1++;
 		*d++ = ':'; *d = '\0';
 	}
@@ -522,7 +575,7 @@ static void run_session(LONG sock, LONG session_no)
 
 	proctags[0].ti_Tag = NP_CodeType;   proctags[0].ti_Data = CODETYPE_PPC;
 	proctags[1].ti_Tag = NP_Entry;      proctags[1].ti_Data = (IPTR)spawn_helper;
-	proctags[2].ti_Tag = NP_StartupMsg; proctags[2].ti_Data = (IPTR)sm;
+	proctags[2].ti_Tag = NP_StartupMsg; proctags[2].ti_Data = (IPTR)s->sm;
 	proctags[3].ti_Tag = NP_Name;       proctags[3].ti_Data = (IPTR)"telnetd session";
 	proctags[4].ti_Tag = NP_WindowPtr;  proctags[4].ti_Data = (IPTR)-1;
 	proctags[5].ti_Tag = TAG_DONE;      proctags[5].ti_Data = 0;
@@ -530,230 +583,120 @@ static void run_session(LONG sock, LONG session_no)
 	if (CreateNewProc(proctags) == NULL)
 	{
 		say("telnetd: could not start the shell\n");
-		goto cleanup_mounted;
+		goto fail;
 	}
 
 	say("telnetd: session on ");
-	say((CONST_STRPTR)mount_name);
+	say((CONST_STRPTR)s->mount_name);
 	say(":\n");
+	return 1;
 
-	/*
-	 * Ending a session.
-	 *
-	 * console_session_finished() answers NO until the Shell has opened a
-	 * console of its own, which is right -- the launcher handing its handles
-	 * back is not the session ending. But it means a session where the Shell
-	 * NEVER establishes can never finish, and this loop then spins forever
-	 * and the daemon never returns to accept(). Every later connection then
-	 * completes its TCP handshake in the kernel backlog and receives nothing,
-	 * which is precisely what AmigaCode measured.
-	 *
-	 * An earlier comment here claimed the idle timeout would end such a
-	 * session. It would have -- and then I removed the idle timeout for
-	 * unrelated reasons and deleted the only exit, without noticing that
-	 * something else depended on it.
-	 *
-	 * So: if the peer has gone AND the launcher has finished, there is
-	 * nothing left to serve, established or not.
-	 */
-	while (!(helper_done && (console_session_finished(&s->con) || s->peer_gone)))
+fail:
+	/* Reachable only before any Shell exists, so these really are ours. */
+	if (s->fh_in)     FreeDosObject(DOS_FILEHANDLE, s->fh_in);
+	if (s->fh_out)    FreeDosObject(DOS_FILEHANDLE, s->fh_out);
+	if (s->sm)        FreeVec(s->sm);
+	if (s->replyport) DeleteMsgPort(s->replyport);
+	if (s->port)      DeleteMsgPort(s->port);
+	if (s->sock >= 0) CloseSocket(s->sock);
+	memset(s, 0, sizeof(*s));
+	s->sock = -1;
+	return 0;
+}
+
+/* One slice of work: whatever this session can do without blocking. */
+static void session_service(struct Session *s, int readable)
+{
+	struct Message *msg;
+	long i;
+
+	if (s->sock >= 0 && readable)
 	{
-		fd_set rd;
-		LONG   sigs = (1UL << port->mp_SigBit)
-		            | (1UL << replyport->mp_SigBit)
-		            | SIGBREAKF_CTRL_C;
-		struct Message *msg;
-		struct timeval tv;
-		long i;
-		LONG nready;
+		unsigned char raw[1024];
+		LONG got = recv(s->sock, raw, sizeof(raw), 0);
 
-		FD_ZERO(&rd);
-		if (s->sock >= 0 && !s->peer_gone)
-			FD_SET(s->sock, &rd);
-
-		/*
-		 * One wait, both worlds: sockets and Exec signals together --
-		 * and a timeout, so a session that stops making progress ends
-		 * itself instead of parking forever holding a mount and a port.
-		 */
-		tv.tv_sec  = SESSION_IDLE_SECS;
-		tv.tv_usec = 0;
-		nready = WaitSelect(s->sock + 1, &rd, NULL, NULL, &tv, (ULONG *)&sigs);
-
-		if (sigs & SIGBREAKF_CTRL_C)
+		if (got > 0)
+		{
+			long room = INBUF_SIZE - s->in_len;
+			long n = telnet_input(&s->tn, raw, got, s->in + s->in_len, room);
+			s->in_len += n;
+		}
+		else if (got == 0)
+		{
+			s->peer_gone = 1;
 			console_begin_drain(&s->con);
-
-		/* --- network -> shell --- */
-		if (s->sock >= 0 && nready > 0 && FD_ISSET(s->sock, &rd))
-		{
-			unsigned char raw[1024];
-			LONG got = recv(s->sock, raw, sizeof(raw), 0);
-
-			if (got > 0)
-			{
-				long room = INBUF_SIZE - s->in_len;
-				long n = telnet_input(&s->tn, raw, got,
-				                      s->in + s->in_len, room);
-				s->in_len += n;
-			}
-			else if (got == 0)
-			{
-				/* Orderly close. Feed the Shell EOF so it exits of
-				 * its own accord rather than being torn away from
-				 * handles it still holds. */
-				s->peer_gone = 1;
-				console_begin_drain(&s->con);
-				say("telnetd: peer closed; draining\n");
-			}
-			/*
-			 * got < 0 is NOT a hangup.
-			 *
-			 * The socket is non-blocking, so -1 with EWOULDBLOCK simply
-			 * means "nothing right now" -- which happens on any spurious
-			 * readability wake-up. Treating it as a hangup ended sessions
-			 * about two seconds after they started, and looked exactly
-			 * like the client disconnecting. Only recv() == 0, the
-			 * orderly close, means the peer has gone.
-			 */
+			say("telnetd: peer closed; draining\n");
 		}
-
-		/* --- retry anything we held back --- */
-		for (i = 0; i < ndef; )
-		{
-			struct DosPacket *p = deferred[i];
-			struct ConsoleReply r =
-				console_dispatch(&s->con, p->dp_Type, p->dp_Arg1,
-				                 p->dp_Arg2, (void *)p->dp_Arg2,
-				                 p->dp_Arg3);
-
-			if (r.defer)
-			{
-				i++;	/* still nothing for it */
-				continue;
-			}
-			ReplyPkt(p, r.res1, r.res2);
-			deferred[i] = deferred[--ndef];
-		}
-
-		/* --- shell -> us --- */
-		while ((msg = GetMsg(port)) != NULL)
-		{
-			struct DosPacket *pkt =
-				(struct DosPacket *)msg->mn_Node.ln_Name;
-			struct ConsoleReply r;
-			void *bufarg = NULL;
-			LONG  len = 0;
-
-			if (pkt == NULL)
-				continue;
-
-			if (pkt->dp_Type == ACTION_READ || pkt->dp_Type == ACTION_WRITE)
-			{
-				bufarg = (void *)pkt->dp_Arg2;
-				len    = pkt->dp_Arg3;
-			}
-
-			say_num("telnetd: packet dp_Type = ", pkt->dp_Type);
-
-			r = console_dispatch(&s->con, pkt->dp_Type, pkt->dp_Arg1,
-			                     pkt->dp_Arg2, bufarg, len);
-
-			if (r.defer)
-			{
-				if (ndef < MAX_DEFERRED)
-				{
-					deferred[ndef++] = pkt;
-					continue;	/* answered later */
-				}
-				r.res1 = 0;	/* out of room: EOF beats losing it */
-			}
-
-			/* Complete an open the way a real handler does:
-			 * ahi-handler/main.c:330-331. fh_Interactive is what
-			 * makes NewShell accept the stream at all. */
-			if (r.res1 == DOSTRUE
-			    && (pkt->dp_Type == ACTION_FINDINPUT
-			     || pkt->dp_Type == ACTION_FINDOUTPUT
-			     || pkt->dp_Type == ACTION_FINDUPDATE))
-			{
-				struct FileHandle *nfh =
-					(struct FileHandle *)BADDR((BPTR)pkt->dp_Arg1);
-				if (nfh)
-				{
-					nfh->fh_Arg1        = HANDLE_OPEN;
-					nfh->fh_Interactive = DOSTRUE;
-				}
-			}
-
-			ReplyPkt(pkt, r.res1, r.res2);
-		}
-
-		while (GetMsg(replyport) != NULL)
-		{
-			helper_done = 1;
-			/* The helper's exit code is the single most useful fact
-			 * when nothing else happens: a shell that never started
-			 * and a shell that started and left look identical from
-			 * the packet side, which is silence either way. */
-			say_num("telnetd: helper finished, SystemTagList rc = ", sm->rc);
-		}
-
-		/*
-		 * NO IDLE TIMEOUT. Two attempts at one were both wrong.
-		 *
-		 * The first counted loop iterations and assumed each was a full
-		 * interval. The second was meant to require WaitSelect to report
-		 * a real timeout -- and never actually reached the file, which I
-		 * did not check before testing it twice on hardware.
-		 *
-		 * Both were the same mistake anyway: inferring elapsed time from
-		 * an event loop. Draining feeds the Shell EOF, so every wrong
-		 * guess killed a live session and looked exactly like the client
-		 * hanging up.
-		 *
-		 * Unix telnetd has no idle limit either -- an idle shell is the
-		 * normal state of a remote login, not a fault. A session ends
-		 * when the peer closes (recv() == 0), when the Shell exits, or
-		 * on CTRL-C. That is the whole policy.
-		 *
-		 * If a reaper for half-open connections is ever wanted it must
-		 * read a CLOCK -- DateStamp() or timer.device -- never the shape
-		 * of this loop.
-		 */
+		/* got < 0 is EWOULDBLOCK on a non-blocking socket, not a hangup. */
 	}
 
-	say("telnetd: session ended\n");
+	/* Reads held back because the socket had nothing to give them. */
+	for (i = 0; i < s->ndef; )
+	{
+		struct DosPacket *p = s->deferred[i];
+		struct ConsoleReply r =
+			console_dispatch(&s->con, p->dp_Type, p->dp_Arg1,
+			                 p->dp_Arg2, (void *)p->dp_Arg2, p->dp_Arg3);
 
-	/* Anything still held must be answered, or the Shell waits forever. */
-	while (ndef > 0)
-		ReplyPkt(deferred[--ndef], 0, 0);
+		if (r.defer) { i++; continue; }
+		ReplyPkt(p, r.res1, r.res2);
+		s->deferred[i] = s->deferred[--s->ndef];
+	}
 
-cleanup_mounted:
-	if (devnode && RemDosEntry(devnode))
-		FreeDosEntry(devnode);
+	while ((msg = GetMsg(s->port)) != NULL)
+	{
+		struct DosPacket *pkt = (struct DosPacket *)msg->mn_Node.ln_Name;
+		struct ConsoleReply r;
+		void *bufarg = NULL;
+		LONG  len = 0;
 
-	/*
-	 * The message port is deliberately NOT freed. Freeing one a Shell may
-	 * still hold a handle to takes down the OS rather than failing politely,
-	 * and the only thing that could vouch for it being safe is the packet
-	 * accounting -- which is the code under test. A leaked port costs a few
-	 * hundred bytes until reboot. Nothing is reclaimed at exit here anyway.
-	 */
-	if (replyport && helper_done) DeleteMsgPort(replyport);
-	if (sm && helper_done)        FreeVec(sm);
-	if (s->sock >= 0)             CloseSocket(s->sock);
-	FreeVec(s);
-	return;
+		if (pkt == NULL)
+			continue;
 
-cleanup_early:
-	/* Reachable only before any Shell exists, so these really are ours. */
-	if (fh_in)     FreeDosObject(DOS_FILEHANDLE, fh_in);
-	if (fh_out)    FreeDosObject(DOS_FILEHANDLE, fh_out);
-	if (sm)        FreeVec(sm);
-	if (replyport) DeleteMsgPort(replyport);
-	if (port)      DeleteMsgPort(port);
-	if (sock >= 0) CloseSocket(sock);
-	FreeVec(s);
+		if (pkt->dp_Type == ACTION_READ || pkt->dp_Type == ACTION_WRITE)
+		{
+			bufarg = (void *)pkt->dp_Arg2;
+			len    = pkt->dp_Arg3;
+		}
+
+		r = console_dispatch(&s->con, pkt->dp_Type, pkt->dp_Arg1,
+		                     pkt->dp_Arg2, bufarg, len);
+
+		if (r.defer)
+		{
+			if (s->ndef < MAX_DEFERRED)
+			{
+				s->deferred[s->ndef++] = pkt;
+				continue;
+			}
+			r.res1 = 0;	/* out of room: EOF beats losing the packet */
+		}
+
+		/* Complete an open the way a real handler does
+		 * (ahi-handler/main.c:330-331). fh_Interactive is what makes
+		 * NewShell accept the stream as a console at all. */
+		if (r.res1 == DOSTRUE
+		    && (pkt->dp_Type == ACTION_FINDINPUT
+		     || pkt->dp_Type == ACTION_FINDOUTPUT
+		     || pkt->dp_Type == ACTION_FINDUPDATE))
+		{
+			struct FileHandle *nfh =
+				(struct FileHandle *)BADDR((BPTR)pkt->dp_Arg1);
+			if (nfh)
+			{
+				nfh->fh_Arg1        = HANDLE_OPEN;
+				nfh->fh_Interactive = DOSTRUE;
+			}
+		}
+
+		ReplyPkt(pkt, r.res1, r.res2);
+	}
+
+	while (GetMsg(s->replyport) != NULL)
+	{
+		s->helper_done = 1;
+		say_num("telnetd: helper finished, SystemTagList rc = ", s->sm->rc);
+	}
 }
 
 /* ------------------------------------------------------------------ */
@@ -762,7 +705,7 @@ int main(int argc, char **argv)
 {
 	struct sockaddr_in addr;
 	struct Process *me;
-	LONG listener, conn;
+	LONG listener;
 	LONG yes = 1;
 	LONG port_no = DEFAULT_PORT;
 	LONG wait_secs = 0;	/* 0 == wait indefinitely */
@@ -773,6 +716,9 @@ int main(int argc, char **argv)
 	me = (struct Process *)FindTask(NULL);
 	if (me)
 		me->pr_WindowPtr = (APTR)-1;
+
+	for (i = 0; i < MAX_SESSIONS; i++)
+		sessions[i].sock = -1;
 
 	for (i = 1; i < argc; i++)
 	{
@@ -812,6 +758,20 @@ int main(int argc, char **argv)
 	}
 
 	UserGroupBase = OpenLibrary("usergroup.library", 0);
+	if (UserGroupBase != NULL)
+	{
+		/*
+		 * A context must exist before any database call. Without it
+		 * getpwnam() returns NULL for every account whatever the
+		 * database holds -- which cost most of an evening, read first as
+		 * an empty store, then a malformed passwd line, then a broken
+		 * netinfo.device. None of those were it.
+		 */
+		struct TagItem tags[1];
+		tags[0].ti_Tag = TAG_DONE;
+		tags[0].ti_Data = 0;
+		ug_SetupContextTagList((CONST_STRPTR)"telnetd", tags);
+	}
 	if (UserGroupBase == NULL && !allow_no_auth)
 	{
 		say("telnetd: usergroup.library not available and no bypass given.\n");
@@ -843,7 +803,10 @@ int main(int argc, char **argv)
 		return RETURN_FAIL;
 	}
 
-	if (listen(listener, 1) < 0)
+	/* A real backlog. With a backlog of 1 the kernel completed handshakes
+	 * for callers this process could not yet reach, so they looked
+	 * connected and received nothing. */
+	if (listen(listener, MAX_SESSIONS + 2) < 0)
 	{
 		say("telnetd: listen() failed\n");
 		CloseSocket(listener);
@@ -854,63 +817,115 @@ int main(int argc, char **argv)
 	say("telnetd: listening on ");
 	say(bind_addr ? bind_addr : (CONST_STRPTR)"all interfaces");
 	say_num(" port ", port_no);
-	say("telnetd: CTRL-C to stop.\n");
+	say_num("telnetd: concurrent sessions = ", MAX_SESSIONS);
 	if (allow_no_auth)
 		say("telnetd: *** AUTHENTICATION DISABLED (-allow-no-auth) ***\n");
 
 	/*
-	 * Wait for a connection WITHOUT calling accept() blindly.
+	 * ONE LOOP, EVERY SESSION.
 	 *
-	 * A bare accept() parks the process in bsdsocket, where it answers
-	 * nothing: not CTRL-C, and not the agent's `bounded` wrapper either,
-	 * because a MorphOS process blocked in a library call does not receive
-	 * a shell-level kill. The first version did exactly that and had to be
-	 * waited out by a 900s watchdog while holding a queue.
-	 *
-	 * WaitSelect over the listening socket fixes it: the same call carries
-	 * an Exec signal mask and an optional timeout, so CTRL-C works and
-	 * -t bounds the wait. An instrument -- or a daemon -- that cannot be
-	 * stopped is not finished.
+	 * WaitSelect takes both a socket set and an Exec signal mask, so a
+	 * single wait covers the listener, every live session's socket, and
+	 * every session's console message port at once. That is what makes a
+	 * single process serve several sessions without threads -- which suits
+	 * a machine where SMP does not work and every session is I/O bound.
 	 */
 	for (;;)
 	{
 		fd_set rd;
 		struct timeval tv;
 		LONG sigs = SIGBREAKF_CTRL_C;
-		LONG n;
+		LONG nready, maxfd = listener;
+		int active = 0;
 
 		FD_ZERO(&rd);
 		FD_SET(listener, &rd);
-		tv.tv_sec = wait_secs;
+
+		for (i = 0; i < MAX_SESSIONS; i++)
+		{
+			struct Session *s = &sessions[i];
+			if (!s->in_use)
+				continue;
+			active++;
+			if (s->sock >= 0 && !s->peer_gone)
+			{
+				FD_SET(s->sock, &rd);
+				if (s->sock > maxfd) maxfd = s->sock;
+			}
+			if (s->port)      sigs |= (1UL << s->port->mp_SigBit);
+			if (s->replyport) sigs |= (1UL << s->replyport->mp_SigBit);
+		}
+
+		tv.tv_sec  = wait_secs > 0 ? wait_secs : 3600;
 		tv.tv_usec = 0;
 
-		n = WaitSelect(listener + 1, &rd, NULL, NULL,
-		               wait_secs > 0 ? &tv : NULL, (ULONG *)&sigs);
+		nready = WaitSelect(maxfd + 1, &rd, NULL, NULL, &tv, (ULONG *)&sigs);
 
 		if (sigs & SIGBREAKF_CTRL_C)
 		{
 			say("telnetd: interrupted; shutting down\n");
 			break;
 		}
-		else if (n > 0 && FD_ISSET(listener, &rd))
+
+		/* Service every session; each decides what it can do. */
+		for (i = 0; i < MAX_SESSIONS; i++)
 		{
-			conn = accept(listener, NULL, NULL);
-			if (conn >= 0)
-				run_session(conn, session_no++);
-			else
-				say("telnetd: accept() failed\n");
-			continue;	/* serve the next caller */
+			struct Session *s = &sessions[i];
+			if (!s->in_use)
+				continue;
+			session_service(s, (nready > 0 && s->sock >= 0
+			                    && FD_ISSET(s->sock, &rd)));
+			if (session_finished(s))
+				session_end(s);
 		}
-		else
+
+		/* A new caller, if there is room for one. */
+		if (nready > 0 && FD_ISSET(listener, &rd))
+		{
+			LONG conn = accept(listener, NULL, NULL);
+			if (conn >= 0)
+			{
+				int slot = -1;
+				for (i = 0; i < MAX_SESSIONS; i++)
+					if (!sessions[i].in_use) { slot = i; break; }
+
+				if (slot < 0)
+				{
+					/*
+					 * Full. Say so and close, rather than
+					 * leaving the caller connected to
+					 * silence -- which is what the old
+					 * single-session server did to every
+					 * second client.
+					 */
+					static const char busy[] =
+						"\r\ntelnetd: too many sessions; try again shortly.\r\n";
+					send(conn, (APTR)busy, (LONG)sizeof(busy) - 1, 0);
+					CloseSocket(conn);
+					say("telnetd: refused a caller, all slots busy\n");
+				}
+				else if (!session_start(&sessions[slot], conn, session_no++))
+				{
+					say("telnetd: session failed to start\n");
+				}
+			}
+			continue;
+		}
+
+		if (nready == 0 && active == 0 && wait_secs > 0)
 		{
 			say("telnetd: no connection within the timeout; exiting\n");
 			break;
 		}
 	}
 
+	for (i = 0; i < MAX_SESSIONS; i++)
+		if (sessions[i].in_use)
+			session_end(&sessions[i]);
+
 	CloseSocket(listener);
-	CloseLibrary(SocketBase);
 	if (UserGroupBase) CloseLibrary(UserGroupBase);
+	CloseLibrary(SocketBase);
 	if (logfh) { say("telnetd: exit\n"); Close(logfh); logfh = 0; }
 	return RETURN_OK;
 }

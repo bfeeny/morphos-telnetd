@@ -71,7 +71,39 @@ int main(int argc, char **argv)
 		say("pwdump: cannot open usergroup.library\n");
 		return RETURN_FAIL;
 	}
-	say("pwdump: usergroup.library opened\n\n");
+	say("pwdump: usergroup.library opened\n");
+
+	/*
+	 * ESTABLISH A CONTEXT FIRST.
+	 *
+	 * usergroup.library is AmiTCP lineage, and in AmiTCP the database calls
+	 * require a context to have been set up before they will work. The setup
+	 * functions come FIRST in usergroup_protos.h, before getpwnam and
+	 * friends, which is a strong hint about the intended order.
+	 *
+	 * If this is the answer, every zero tonight was the library declining to
+	 * answer a question it had not been opened for -- regardless of what was
+	 * in any passwd file, and regardless of netinfo.
+	 */
+	{
+		struct TagItem tags[1];
+		int rc;
+
+		tags[0].ti_Tag = TAG_DONE;
+		tags[0].ti_Data = 0;
+
+		rc = ug_SetupContextTagList((CONST_STRPTR)"pwdump", tags);
+		say_num("ug_SetupContextTagList() -> ", (LONG)rc);
+		if (rc != 0)
+		{
+			LONG e = ug_GetErr();
+			say_num("  ug_GetErr() = ", e);
+			say("  ug_StrError: ");
+			say((CONST_STRPTR)ug_StrError(e));
+			say("\n");
+		}
+	}
+	say("\n");
 
 	/* Who does the library think we are already? */
 	{
@@ -84,6 +116,13 @@ int main(int argc, char **argv)
 	}
 
 	say("--- enumerating the password database ---\n");
+	{
+		LONG e;
+		setpwent();
+		e = ug_GetErr();
+		say_num("  ug_GetErr() after setpwent() = ", e);
+		if (e != 0) { say("  ug_StrError: "); say((CONST_STRPTR)ug_StrError(e)); say("\n"); }
+	}
 	setpwent();
 	while ((pw = getpwent()) != NULL)
 	{
@@ -102,7 +141,20 @@ int main(int argc, char **argv)
 		say("\") ---\n");
 		pw = getpwnam((STRPTR)argv[1]);
 		if (pw == NULL)
-			say("  NULL -- no such user according to usergroup.library\n");
+		{
+			/*
+			 * ASK, rather than infer. A bare NULL has been read all
+			 * evening as "empty database" and guessed at four
+			 * different ways; the library has an error channel and
+			 * it was never consulted.
+			 */
+			LONG e = ug_GetErr();
+			say("  NULL -- and the library says why:\n");
+			say_num("    ug_GetErr() = ", e);
+			say("    ug_StrError: ");
+			say((CONST_STRPTR)ug_StrError(e));
+			say("\n");
+		}
 		else
 			show(pw);
 	}
