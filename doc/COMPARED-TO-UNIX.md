@@ -260,10 +260,13 @@ much of the SDK) ask a console for things the MorphOS Shell never does:
 - **`ACTION_EXAMINE_FH`** — `fstat()`. Answered with `ST_PIPEFILE`, which ixemul
   maps to `S_IFCHR`; `ST_FILE` would make us one of the handlers ixemul's source
   complains about, whose "console windows claim they're plain files".
-- **`/dev/tty` does not work.** ixemul maps it to the AmigaDOS `"*"`, and
-  `Open("*")` does not resolve on this console. pdksh therefore reports
-  *"No controlling tty"* and runs without job control. This is a genuine
-  limitation, not yet solved.
+- **`/dev/tty` does not work**, so pdksh reports *"No controlling tty"* and runs
+  without job control. Note what this is *not*: `Open("*")` resolves to this
+  handler correctly and returns a working interactive handle — measured with
+  `probe/starprobe.c`. ixemul does not use `Open()` for `/dev/tty`; it maps the
+  name to `"*"` and calls its own `__open()`, and that is where the failure
+  lives. Unsolved, and the next step is a packet trace rather than more
+  reading.
 
 An interactive `pdksh` over telnet **does** work (`GG:bin/sh` — it is not on the
 MorphOS Shell's path), including POSIX arithmetic and exit status.
