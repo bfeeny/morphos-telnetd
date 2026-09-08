@@ -1679,6 +1679,17 @@ static void daemon_main(void)
 	{
 		LONG waited = 0;
 
+		/*
+		 * A heartbeat, because the interesting failure happens INSIDE
+		 * this loop.
+		 *
+		 * At boot the child logged that it was waiting and was then
+		 * simply gone -- no success line, no give-up line, no process.
+		 * A single line at the start cannot distinguish "died after two
+		 * seconds" from "waited the full minute and then died", and
+		 * those point at completely different things. So it says how far
+		 * it got, and the last line standing is the answer.
+		 */
 		for (;;)
 		{
 			SocketBase = OpenLibrary("bsdsocket.library", 4);
@@ -1686,9 +1697,13 @@ static void daemon_main(void)
 				break;
 			if (waited == 0)
 				say("telnetd: waiting for the network stack\n");
+			else if ((waited % 5) == 0)
+				say_num("telnetd: still waiting, seconds = ", waited);
 			Delay(50);	/* one second: 50 ticks */
 			waited++;
 		}
+
+		say_num("telnetd: network wait finished, seconds = ", waited);
 
 		if (SocketBase == NULL)
 		{
