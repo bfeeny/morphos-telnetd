@@ -381,9 +381,28 @@ static int authenticate(struct Session *s)
 		say_num("telnetd: getpwnam failed, ug_GetErr = ", e);
 	}
 
-	res = auth_policy(pw ? pw->pw_passwd : NULL,
-	                  (pw && pass[0]) ? (const char *)crypt((STRPTR)pass, (STRPTR)salt)
-	                                  : NULL);
+	/*
+	 * THE STORED HASH IS THE SALT.
+	 *
+	 * crypt() takes the whole stored string as its salt argument and reads
+	 * out whatever prefix its format needs -- two characters for classic
+	 * DES, "$1$...$" for MD5. Passing a salt obtained separately only works
+	 * if it happens to match the format of the stored entry, and a mismatch
+	 * fails as an ordinary wrong password with nothing to distinguish it.
+	 *
+	 * ug_GetSalt() is kept as a fallback for an entry whose format crypt()
+	 * cannot infer from the hash alone.
+	 */
+	{
+		const char *saltp = (pw && pw->pw_passwd && pw->pw_passwd[0])
+		                    ? (const char *)pw->pw_passwd
+		                    : (const char *)salt;
+
+		res = auth_policy(pw ? pw->pw_passwd : NULL,
+		                  (pw && pass[0])
+		                      ? (const char *)crypt((STRPTR)pass, (STRPTR)saltp)
+		                      : NULL);
+	}
 
 	/* Wipe the typed password as soon as it has been hashed. */
 	for (i = 0; i < (int)sizeof(pass); i++)
