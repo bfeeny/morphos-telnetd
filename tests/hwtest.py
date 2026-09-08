@@ -41,10 +41,21 @@ class Telnet:
             self.sock.sendall(bytes([IAC, DONT, opt]))
 
     def send_naws(self):
-        self.sock.sendall(bytes([IAC, SB, OPT_NAWS,
-                                 self.cols >> 8, self.cols & 0xFF,
-                                 self.rows >> 8, self.rows & 0xFF,
-                                 IAC, SE]))
+        """RFC 1073: a dimension byte of 255 is data and must be sent as
+        IAC IAC, exactly like any other 255 in the stream.
+
+        Without this the harness is the non-conforming end: a cols=255 test
+        would make a correct daemon look broken and send us hunting a bug in
+        the code under test. That is the third instrument-not-subject error on
+        this project today, and this one was in our own test kit."""
+        body = [self.cols >> 8, self.cols & 0xFF,
+                self.rows >> 8, self.rows & 0xFF]
+        escaped = []
+        for b in body:
+            escaped.append(b)
+            if b == IAC:
+                escaped.append(IAC)
+        self.sock.sendall(bytes([IAC, SB, OPT_NAWS] + escaped + [IAC, SE]))
 
     def _feed(self, data):
         out, i = b"", 0

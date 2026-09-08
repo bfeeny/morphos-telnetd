@@ -155,6 +155,23 @@ static int allow_no_auth = 0;
  * genuinely still running, and answering it is the job.
  */
 #define REAPER_QUIET_SECS 30
+
+/*
+ * How long a launched Shell has to open a console of its own.
+ *
+ * SESSION_IDLE_SECS below is defined and never used, and console_handler.h
+ * still promises that "a session that never establishes is ended by the
+ * caller's idle timeout" -- a guard that went with the iteration-counted timer
+ * and was never replaced. Without it, a Shell that fails to start leaves a
+ * session that can NEVER be finished: console_session_finished() requires
+ * `established`, and session_expired() requires a departed peer. A client that
+ * politely waits for a prompt then holds the slot for good, and four of those
+ * take the daemon out of service.
+ *
+ * Generous, because it is a backstop and not a policy: a Shell opens its
+ * console within a second or two of starting.
+ */
+#define ESTABLISH_SECS 120
 /*
  * How long a session may sit doing nothing before we wind it down.
  *
@@ -244,6 +261,7 @@ struct Session
 	int    shell_started;
 	ULONG  login_deadline;
 	ULONG  bye_deadline;
+	ULONG  establish_deadline;
 	char   login_user[64];
 	char   login_pass[128];
 	long   login_n;
@@ -876,8 +894,34 @@ static void login_consume(struct Session *s)
 		}
 	}
 
+	/*
+	 * Nothing the login consumed may remain anywhere in this buffer.
+	 *
+	 * login_forget() wipes in[0 .. in_pos), which is right for one segment
+	 * and wrong across several: in_pos is reset to 0 after each fully
+	 * consumed read, so a password arriving split -- "hunter2" in one
+	 * segment and the newline in the next, which is what typing looks like
+	 * -- left its earlier pieces sitting above in_len, wiped by nobody until
+	 * session_end.
+	 */
 	if (s->in_pos >= s->in_len)
+	{
+		long i;
+		for (i = 0; i < INBUF_SIZE; i++)
+			s->in[i] = 0;
 		s->in_len = s->in_pos = 0;
+	}
+	else
+	{
+		/* A remainder was typed for the Shell: keep it, wipe behind it. */
+		long rem = s->in_len - s->in_pos, i;
+
+		memmove(s->in, s->in + s->in_pos, rem);
+		for (i = rem; i < INBUF_SIZE; i++)
+			s->in[i] = 0;
+		s->in_len = rem;
+		s->in_pos = 0;
+	}
 }
 
 /* ------------------------------------------------------------------ */
@@ -1184,6 +1228,12 @@ static int session_expired(struct Session *s)
 	if (!s->shell_started)
 		return 0;	/* bounded by the login deadline instead */
 
+	/* Launched, but it never opened a console of its own. */
+	if (!s->con.established
+	    && s->establish_deadline != 0
+	    && now_secs() >= s->establish_deadline)
+		return 1;
+
 	return s->peer_gone
 	    && s->drain_deadline != 0
 	    && now_secs() >= s->drain_deadline;
@@ -1370,8 +1420,9 @@ static int session_launch_shell(struct Session *s)
 		return 0;
 	}
 
-	s->shell_started = 1;
-	s->phase         = PHASE_SHELL;
+	s->shell_started      = 1;
+	s->phase              = PHASE_SHELL;
+	s->establish_deadline = now_secs() + ESTABLISH_SECS;
 
 	say("telnetd: session on ");
 	say((CONST_STRPTR)s->mount_name);
@@ -1446,6 +1497,14 @@ static void session_service(struct Session *s, int readable, int writable)
 			s->peer_gone      = 1;
 			s->drain_deadline = now_secs() + DRAIN_GRACE_SECS;
 			console_begin_drain(&s->con);
+			/*
+			 * Throw the queue away. Nothing will ever send it now, so
+			 * keeping it holds net_pending above the high-water mark
+			 * forever -- which stops the console port being serviced
+			 * at all, leaving the Shell blocked in WaitPort until a
+			 * reaper happens to be free. Drain means drain.
+			 */
+			s->out_len = s->out_pos = 0;
 			say("telnetd: peer closed; draining\n");
 		}
 		else
@@ -1465,6 +1524,7 @@ static void session_service(struct Session *s, int readable, int writable)
 				s->peer_gone      = 1;
 				s->drain_deadline = now_secs() + DRAIN_GRACE_SECS;
 				console_begin_drain(&s->con);
+				s->out_len = s->out_pos = 0;
 				say_num("telnetd: peer reset; draining, errno = ", e);
 			}
 		}
@@ -2007,7 +2067,9 @@ static void daemon_main(void)
 				 * than us parsing bytes and dropping them. */
 				if (!s->peer_gone && s->in_len < INBUF_SIZE)
 					FD_SET(s->sock, &rd);
-				if (net_pending(s) > 0)
+				/* Never watch a dead socket for writability: it
+				 * reports ready every time and spins the loop. */
+				if (!s->peer_gone && net_pending(s) > 0)
 					FD_SET(s->sock, &wr);
 				if (s->sock > maxfd) maxfd = s->sock;
 			}
@@ -2015,7 +2077,8 @@ static void daemon_main(void)
 			 * completed, a drain not yet finished -- needs the wait
 			 * kept short enough to reach that deadline. Queued
 			 * output does not: the write set already wakes us. */
-			if (!s->shell_started || s->peer_gone)
+			if (!s->shell_started || s->peer_gone
+			    || !s->con.established)
 				deadline_pending++;
 			if (s->port)      sigs |= (1UL << s->port->mp_SigBit);
 			if (s->replyport) sigs |= (1UL << s->replyport->mp_SigBit);
