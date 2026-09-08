@@ -427,18 +427,23 @@ static void test_size_answered_from_current_value(void)
 	CHECK(memcmp(got + 1, "1;1;50;200 r", 12) == 0, "the newer size wins");
 }
 
-static void test_unknown_size_reports_nothing(void)
+static void test_a_size_is_always_available(void)
 {
 	struct ConsoleState st;
 	struct FakeIO io;
 	char got[64];
+	static const char q[3] = { (char)0x9B, ' ', 'q' };
 
-	printf("with no NAWS yet, we stay silent rather than invent a size\n");
+	printf("with NO NAWS ever, the query is still answered (silence hangs)\n");
 	setup(&st, &io, "");
 
-	console_dispatch(&st, ACTION_WRITE, 2, 0, (void *)CSI_SP_Q, 3);
-	CHECK(st.size_requests == 1, "request still counted");
-	CHECK(drain_reply(&st, got, (long)sizeof(got)) == 0, "nothing queued");
+	console_dispatch(&st, ACTION_WRITE, 2, 0, (void *)q, 3);
+	memset(got, 0, sizeof(got));
+	drain_reply(&st, got, (long)sizeof(got));
+
+	CHECK((unsigned char)got[0] == 0x9B, "a reply is produced");
+	CHECK(memcmp(got + 1, "1;1;24;80 r", 11) == 0,
+	      "defaults to 80x24, ixemul's own fallback");
 }
 
 static void test_size_reply_outranks_normal_input(void)
@@ -619,7 +624,7 @@ int main(void)
 	test_size_report_is_split_safe();
 	test_partial_match_is_not_swallowed();
 	test_size_answered_from_current_value();
-	test_unknown_size_reports_nothing();
+	test_a_size_is_always_available();
 	test_size_reply_outranks_normal_input();
 	test_empty_socket_defers_rather_than_signalling_eof();
 	test_closed_socket_really_is_eof();

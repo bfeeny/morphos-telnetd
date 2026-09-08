@@ -29,8 +29,19 @@ void console_init(struct ConsoleState *st,
 	st->unknown      = 0;
 	st->signal_task  = 0;
 	st->signals_seen = 0;
-	st->rows         = 0;
-	st->cols         = 0;
+	/*
+	 * A DEFAULT SIZE, not "unknown".
+	 *
+	 * Answering CSI SP q with silence is not a benign degradation: the
+	 * program that asked blocks forever waiting for a reply, and takes the
+	 * session with it. Measured by AmigaCode with a client that offers no
+	 * NAWS at all -- the shell never came back.
+	 *
+	 * 80x24 is ixemul's own fallback and what every ported program already
+	 * expects. A wrong size is recoverable; a hang is not.
+	 */
+	st->rows         = 24;
+	st->cols         = 80;
 	st->pending_len  = 0;
 	st->pending_pos  = 0;
 	st->q_state      = 0;

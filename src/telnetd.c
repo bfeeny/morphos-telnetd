@@ -537,7 +537,26 @@ static void run_session(LONG sock, LONG session_no)
 	say((CONST_STRPTR)mount_name);
 	say(":\n");
 
-	while (!helper_done || !console_session_finished(&s->con))
+	/*
+	 * Ending a session.
+	 *
+	 * console_session_finished() answers NO until the Shell has opened a
+	 * console of its own, which is right -- the launcher handing its handles
+	 * back is not the session ending. But it means a session where the Shell
+	 * NEVER establishes can never finish, and this loop then spins forever
+	 * and the daemon never returns to accept(). Every later connection then
+	 * completes its TCP handshake in the kernel backlog and receives nothing,
+	 * which is precisely what AmigaCode measured.
+	 *
+	 * An earlier comment here claimed the idle timeout would end such a
+	 * session. It would have -- and then I removed the idle timeout for
+	 * unrelated reasons and deleted the only exit, without noticing that
+	 * something else depended on it.
+	 *
+	 * So: if the peer has gone AND the launcher has finished, there is
+	 * nothing left to serve, established or not.
+	 */
+	while (!(helper_done && (console_session_finished(&s->con) || s->peer_gone)))
 	{
 		fd_set rd;
 		LONG   sigs = (1UL << port->mp_SigBit)
@@ -579,7 +598,12 @@ static void run_session(LONG sock, LONG session_no)
 			}
 			else if (got == 0)
 			{
-				s->peer_gone = 1;	/* orderly close: the peer really has gone */
+				/* Orderly close. Feed the Shell EOF so it exits of
+				 * its own accord rather than being torn away from
+				 * handles it still holds. */
+				s->peer_gone = 1;
+				console_begin_drain(&s->con);
+				say("telnetd: peer closed; draining\n");
 			}
 			/*
 			 * got < 0 is NOT a hangup.
