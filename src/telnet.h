@@ -42,6 +42,11 @@ struct TelnetState
 	int           sb_overflow;
 
 	long commands;	/* how many IAC sequences we have seen */
+
+	/* Outbound: a CR whose successor decides what it meant. See
+	 * telnet_output(); it cannot span a call, so it is flushed as a bare
+	 * CR rather than delaying output that may be a live prompt. */
+	int  out_cr_held;
 };
 
 void telnet_init(struct TelnetState *ts,

@@ -44,6 +44,7 @@ void telnet_init(struct TelnetState *ts,
 	ts->sb_len  = 0;
 	ts->sb_overflow = 0;
 	ts->commands = 0;
+	ts->out_cr_held = 0;
 }
 
 static void raw_out(struct TelnetState *ts, const unsigned char *b, long n)
@@ -231,23 +232,80 @@ long telnet_input(struct TelnetState *ts,
 }
 
 /*
- * Outbound: a literal 255 in program output must be sent as IAC IAC or the
- * client reads it as a command. Done in exactly one place so a stray byte
- * cannot escape unescaped.
+ * Outbound: put program output into NVT form.
+ *
+ * Three substitutions, and only one of them was here before.
+ *
+ * A literal 255 must be sent as IAC IAC or the client reads it as a command.
+ *
+ * A NEWLINE MUST GO OUT AS CR LF. RFC 854 p.11: "the sequence CR LF must be
+ * treated as a single new line character". The Shell writes the Amiga
+ * convention -- a bare LF -- and this passed it straight through, which was
+ * measured on the wire: `version` came back as "...51.66\n" with no CR. A Unix
+ * telnetd never has to think about it because the pty's ONLCR does it; we have
+ * no pty, so it is ours to do. A client that has cleared ONLCR on its own
+ * terminal -- which BSD telnet does once it accepts our WILL ECHO -- staircases
+ * without this, each line starting where the last one ended.
+ *
+ * A BARE CR MUST GO OUT AS CR NUL, same page: "the CR character must be avoided
+ * in other contexts". Otherwise a client is entitled to read the next byte as
+ * part of a line ending.
+ *
+ * A CR at the very end of a buffer is emitted as a bare CR rather than held for
+ * the next call. Holding it would be more correct and would also delay it, and
+ * this buffer may be a prompt somebody is waiting to see; a split CR LF then
+ * arrives as CR NUL CR LF, which renders identically.
  */
 void telnet_output(struct TelnetState *ts, const unsigned char *buf, long len)
 {
 	static const unsigned char IACIAC[2] = { IAC, IAC };
+	static const unsigned char CRLF[2]   = { '\r', '\n' };
+	static const unsigned char CRNUL[2]  = { '\r', '\0' };
 	long i, run = 0;
 
 	for (i = 0; i < len; i++)
 	{
-		if (buf[i] == IAC)
+		unsigned char c = buf[i];
+
+		if (ts->out_cr_held)
+		{
+			ts->out_cr_held = 0;
+			run = i;
+			if (c == '\n')
+			{
+				raw_out(ts, CRLF, 2);	/* CR LF stays CR LF */
+				run = i + 1;
+				continue;
+			}
+			raw_out(ts, CRNUL, 2);		/* it was a bare CR */
+			/* and c still has to be handled below */
+		}
+
+		if (c == '\r')
+		{
+			raw_out(ts, buf + run, i - run);
+			ts->out_cr_held = 1;
+			run = i + 1;
+		}
+		else if (c == '\n')
+		{
+			raw_out(ts, buf + run, i - run);
+			raw_out(ts, CRLF, 2);
+			run = i + 1;
+		}
+		else if (c == IAC)
 		{
 			raw_out(ts, buf + run, i - run);
 			raw_out(ts, IACIAC, 2);
 			run = i + 1;
 		}
 	}
+
 	raw_out(ts, buf + run, len - run);
+
+	if (ts->out_cr_held)
+	{
+		ts->out_cr_held = 0;
+		raw_out(ts, CRNUL, 2);
+	}
 }

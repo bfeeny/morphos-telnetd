@@ -189,6 +189,83 @@ static void test_output_escapes_255(void)
 	      && s.out[3] == 'b', "IAC IAC in the middle");
 }
 
+/*
+ * RFC 854 p.11: "the sequence CR LF must be treated as a single new line
+ * character" and "the CR character must be avoided in other contexts".
+ *
+ * These matter because there is no pty here. A Unix telnetd gets newline
+ * translation free from the terminal driver's ONLCR; we are the terminal, so if
+ * we do not do it, nobody does -- and it was measured going out wrong: `version`
+ * reached the wire as "...51.66\n" with no CR at all.
+ */
+static void test_output_lf_becomes_crlf(void)
+{
+	struct TelnetState ts; struct Sink s;
+
+	printf("a bare LF from the Shell goes out as CR LF\n");
+	setup(&ts, &s);
+
+	telnet_output(&ts, (const unsigned char *)"hi\n", 3);
+	CHECK(s.out_len == 4, "three bytes became four");
+	CHECK(s.out[0] == 'h' && s.out[1] == 'i', "the text is untouched");
+	CHECK(s.out[2] == '\r' && s.out[3] == '\n', "and the newline is CR LF");
+}
+
+static void test_output_crlf_stays_crlf(void)
+{
+	struct TelnetState ts; struct Sink s;
+
+	printf("our own CR LF is not doubled into CR CR LF\n");
+	setup(&ts, &s);
+
+	telnet_output(&ts, (const unsigned char *)"hi\r\n", 4);
+	CHECK(s.out_len == 4, "nothing was added");
+	CHECK(s.out[2] == '\r' && s.out[3] == '\n', "exactly one CR LF");
+}
+
+static void test_output_bare_cr_becomes_cr_nul(void)
+{
+	struct TelnetState ts; struct Sink s;
+
+	printf("a bare CR goes out as CR NUL, so it cannot start a line ending\n");
+	setup(&ts, &s);
+
+	telnet_output(&ts, (const unsigned char *)"a\rb", 3);
+	CHECK(s.out_len == 4, "one byte became two");
+	CHECK(s.out[0] == 'a' && s.out[1] == '\r' && s.out[2] == '\0'
+	      && s.out[3] == 'b', "CR NUL in the middle");
+}
+
+static void test_output_trailing_cr_is_not_held(void)
+{
+	struct TelnetState ts; struct Sink s;
+
+	printf("a CR ending a write is emitted, not held for the next one\n");
+	setup(&ts, &s);
+
+	/* Holding it would be more correct and would also delay it -- and this
+	 * buffer may be a prompt somebody is waiting to see. */
+	telnet_output(&ts, (const unsigned char *)"x\r", 2);
+	CHECK(s.out_len == 3, "the CR went out immediately");
+	CHECK(s.out[1] == '\r' && s.out[2] == '\0', "as a bare CR");
+	CHECK(ts.out_cr_held == 0, "and nothing is left pending");
+}
+
+static void test_output_255_and_newline_together(void)
+{
+	struct TelnetState ts; struct Sink s;
+	const unsigned char buf[] = { 255, '\n', 255 };
+
+	printf("escaping and newline translation do not interfere\n");
+	setup(&ts, &s);
+
+	telnet_output(&ts, buf, 3);
+	CHECK(s.out_len == 6, "two escapes and one added CR");
+	CHECK(s.out[0] == 255 && s.out[1] == 255, "leading IAC doubled");
+	CHECK(s.out[2] == '\r' && s.out[3] == '\n', "then CR LF");
+	CHECK(s.out[4] == 255 && s.out[5] == 255, "trailing IAC doubled");
+}
+
 static void test_opening_offer(void)
 {
 	struct TelnetState ts; struct Sink s;
@@ -259,6 +336,11 @@ int main(void)
 	test_unwanted_options_are_refused();
 	test_oversized_subnegotiation_is_bounded();
 	test_output_escapes_255();
+	test_output_lf_becomes_crlf();
+	test_output_crlf_stays_crlf();
+	test_output_bare_cr_becomes_cr_nul();
+	test_output_trailing_cr_is_not_held();
+	test_output_255_and_newline_together();
 	test_opening_offer();
 	test_crlf_becomes_newline();
 	test_cr_nul_is_a_bare_cr();
