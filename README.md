@@ -85,9 +85,12 @@ packets itself. `ACTION_WAIT_CHAR` is `select()`; `ACTION_SCREEN_MODE` is the
 line discipline.
 
 `doc/ARCHITECTURE.md` has the detail, including why this is a libnix build and
-why the shell-attach layer is deliberately separable. `doc/PRIOR-ART.md` records
-what was surveyed first. `doc/SECURITY.md` is honest about what telnet does and
-does not protect.
+why the shell-attach layer is deliberately separable.
+**`doc/COMPARED-TO-UNIX.md` is the one to read if you already know what a Unix
+telnetd does** — what changes without a pty, and why almost every structural
+decision here follows from that. `doc/PRIOR-ART.md` records what was surveyed
+first. `doc/SECURITY.md` is honest about what telnet does and does not
+protect.
 
 ## Licence
 
