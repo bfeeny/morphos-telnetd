@@ -1623,7 +1623,7 @@ static void daemon_main(void)
 {
 	struct sockaddr_in addr;
 	struct Process *me;
-	LONG listener;
+	LONG listener = -1;	/* MUST be initialised: `done:` tests it */
 	LONG yes = 1;
 	LONG port_no = cfg_port;
 	LONG wait_secs = cfg_wait;
@@ -1739,26 +1739,80 @@ static void daemon_main(void)
 		goto done;
 	}
 
-	listener = socket(AF_INET, SOCK_STREAM, 0);
-	if (listener < 0)
+	/*
+	 * RETRY BIND, rather than wait for a proxy and then bind once.
+	 *
+	 * -n used to wait for OpenLibrary("bsdsocket.library") to succeed and
+	 * then bind exactly once. At boot that wait was satisfied INSTANTLY --
+	 * measured: not one heartbeat line -- because the library is loadable
+	 * almost immediately while the stack behind it is still coming up. So
+	 * the readiness test passed, bind ran into a stack that was not ready,
+	 * and the daemon exited. Waiting on a proxy and then performing the real
+	 * operation once is the bug; bind is the thing we actually need, and it
+	 * is its own readiness test.
+	 *
+	 * The message was worse than the bug. It said "port in use?" for ANY
+	 * bind failure -- mapping every cause onto the most familiar one -- and
+	 * cost amigacode a hunt for a collision that did not exist. It now
+	 * reports the errno and says nothing it does not know. Diagnosis by
+	 * amigacode, who had the log and read it properly.
+	 *
+	 * With no -n this is still exactly one attempt, so starting on a port
+	 * somebody else holds still fails at once.
+	 */
 	{
-		say("telnetd: socket() failed\n");
-		goto done;
-	}
+		LONG waited = 0;
+		LONG e = 0;
 
-	setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, (APTR)&yes, sizeof(yes));
+		for (;;)
+		{
+			listener = socket(AF_INET, SOCK_STREAM, 0);
+			if (listener < 0)
+			{
+				e = Errno();
+			}
+			else
+			{
+				setsockopt(listener, SOL_SOCKET, SO_REUSEADDR,
+				           (APTR)&yes, sizeof(yes));
 
-	memset(&addr, 0, sizeof(addr));
-	addr.sin_family = AF_INET;
-	addr.sin_port   = htons((unsigned short)port_no);
-	addr.sin_addr.s_addr = bind_addr ? inet_addr(bind_addr) : INADDR_ANY;
+				memset(&addr, 0, sizeof(addr));
+				addr.sin_family = AF_INET;
+				addr.sin_port   = htons((unsigned short)port_no);
+				addr.sin_addr.s_addr =
+					bind_addr ? inet_addr(bind_addr) : INADDR_ANY;
 
-	if (bind(listener, (struct sockaddr *)&addr, sizeof(addr)) < 0)
-	{
-		say_num("telnetd: bind() failed -- port in use? port = ", port_no);
-		CloseSocket(listener);
-		listener = -1;
-		goto done;
+				if (bind(listener, (struct sockaddr *)&addr,
+				         sizeof(addr)) >= 0)
+					break;
+
+				e = Errno();
+
+				/* A fresh socket each attempt: a stack that
+				 * refused one may have marked it. */
+				CloseSocket(listener);
+				listener = -1;
+			}
+
+			if (waited >= cfg_netwait)
+			{
+				say_num("telnetd: cannot bind port ", port_no);
+				say_num("telnetd: last errno was ", e);
+				say_num("telnetd: after waiting seconds = ", waited);
+				say("telnetd: errno 48 is the port already taken; anything\n");
+				say("telnetd: else usually means the stack is not ready.\n");
+				goto done;
+			}
+
+			if (waited == 0 || (waited % 5) == 0)
+				say_num("telnetd: bind not ready, errno = ", e);
+
+			Delay(50);	/* one second */
+			waited++;
+		}
+
+		if (waited > 0)
+			say_num("telnetd: bound after seconds = ", waited);
 	}
 
 	/* A real backlog. With a backlog of 1 the kernel completed handshakes
@@ -1976,7 +2030,23 @@ done:
 	 *
 	 * A failure must never take its reason with it.
 	 */
-	if (listener >= 0)      CloseSocket(listener);
+	/*
+	 * Order matters, and so does that initialiser.
+	 *
+	 * `listener` was uninitialised. The two paths that fail before a socket
+	 * exists -- bsdsocket.library never appearing, usergroup.library missing
+	 * -- arrive here with SocketBase NULL and whatever was in that stack
+	 * slot deciding whether we then call CloseSocket() through a NULL
+	 * library base. On this platform that is not an error return, it is a
+	 * dead machine: a jump through address zero minus an LVO.
+	 *
+	 * It was introduced by the commit that added this label, and the path it
+	 * sits on is exactly the one a boot with a late network stack takes --
+	 * so the code written to diagnose a silent boot failure could itself
+	 * have caused one, with the same symptoms. Found in review before it
+	 * ever ran that path.
+	 */
+	if (SocketBase && listener >= 0) CloseSocket(listener);
 	if (UserGroupBase)      CloseLibrary(UserGroupBase);
 	if (SocketBase)         CloseLibrary(SocketBase);
 	if (logfh) { say("telnetd: exit\n"); Close(logfh); logfh = 0; }
