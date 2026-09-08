@@ -83,6 +83,42 @@ static int allow_no_auth = 0;
 #define SHELL_COMMAND  "NewShell " MOUNT_NAME ":"
 #define INBUF_SIZE     4096
 #define MAX_DEFERRED   8
+
+/*
+ * Consoles outlive their sessions, so there has to be somewhere to put them.
+ *
+ * When the client vanishes, the Shell does not stop existing: it is told EOF
+ * and exits of its own accord, but that takes as long as whatever it was doing
+ * takes. Ending the session at the moment of disconnect left the Shell writing
+ * to a message port nobody would ever read again, so it blocked in WaitPort
+ * forever -- one stranded process per abrupt disconnect, on a machine that
+ * reclaims nothing until it is rebooted.
+ *
+ * A reaper is the rest of that session: the port and the packet accounting,
+ * with the socket gone. It keeps answering until the Shell has closed
+ * everything, and only then is the port done with.
+ */
+#define MAX_REAPERS      8
+
+/* How long a disconnected session keeps its slot before a reaper takes over.
+ * A Shell sitting at a prompt exits the instant it is told EOF; this is the
+ * allowance for one that was mid-command. */
+#define DRAIN_GRACE_SECS 10
+
+/*
+ * How long a reaper waits on a console that never became established.
+ *
+ * A session whose Shell never opened a console of its own can never satisfy
+ * console_session_finished(), which requires `established`. Waiting forever for
+ * that would pin a reaper and its signal bit on a session that failed at the
+ * starting line -- so a console that never established and has since gone quiet
+ * is treated as done. Nothing beyond the two launch handles was ever handed
+ * out, and the helper closes those.
+ *
+ * A console that DID establish is never timed out: open handles mean a Shell is
+ * genuinely still running, and answering it is the job.
+ */
+#define REAPER_QUIET_SECS 30
 /*
  * How long a session may sit doing nothing before we wind it down.
  *
@@ -129,6 +165,7 @@ struct Session
 	long          in_len;
 	long          in_pos;
 	int           peer_gone;
+	ULONG         drain_deadline;	/* 0 == not draining; see DRAIN_GRACE_SECS */
 
 	struct MsgPort    *port;	/* the Shell's console */
 	struct MsgPort    *replyport;	/* the helper's exit notification */
@@ -145,6 +182,101 @@ struct Session
 
 #define MAX_SESSIONS 4
 static struct Session sessions[MAX_SESSIONS];
+
+/*
+ * A coarse wall clock, in seconds.
+ *
+ * DateStamp() is the clock a -noixemul build has, and using a real one is the
+ * point: the idle timer this replaces counted loop iterations instead, so a
+ * limit measured in seconds expired in milliseconds. ds_Tick is 1/50s.
+ */
+static ULONG now_secs(void)
+{
+	struct DateStamp ds;
+
+	DateStamp(&ds);
+	return (ULONG)ds.ds_Days * 86400u
+	     + (ULONG)ds.ds_Minute * 60u
+	     + (ULONG)ds.ds_Tick / 50u;
+}
+
+/* ------------------------------------------------------------------ */
+/* Message ports are a scarce resource, so they are reused, not discarded.
+ *
+ * CreateMsgPort() allocates an Exec SIGNAL BIT, and a task has 32 of them with
+ * the low 16 reserved. Never releasing a port therefore did not merely leak a
+ * few hundred bytes as the teardown note claimed -- it leaked one of about a
+ * dozen signal bits, so after that many logins CreateMsgPort() returned NULL
+ * and every subsequent caller was refused with "session setup failed" until
+ * the daemon was restarted. The memory was the cheap part.
+ *
+ * Recycling is not the same gamble as freeing, which is why it is allowed here
+ * when freeing still is not. A freed port is memory a Shell might PutMsg into,
+ * and that kills the machine. A recycled port stays valid and stays ours; the
+ * worst a stray packet can do is arrive at a port we are still reading. It is
+ * only ever offered a port whose session finished cleanly, and it is refused
+ * if anything is still queued on it.
+ */
+#define MAX_PORT_POOL (MAX_SESSIONS + MAX_REAPERS)
+static struct MsgPort *port_pool[MAX_PORT_POOL];
+static long            port_pool_n;
+
+static struct MsgPort *port_get(void)
+{
+	while (port_pool_n > 0)
+	{
+		struct MsgPort *p = port_pool[--port_pool_n];
+		if (p)
+			return p;
+	}
+	return CreateMsgPort();
+}
+
+static void port_put(struct MsgPort *p)
+{
+	int empty;
+
+	if (p == NULL)
+		return;
+
+	/* A message still on the queue means something out there believes this
+	 * is its console. Leak it rather than hand it to the next caller. */
+	Forbid();
+	empty = (p->mp_MsgList.lh_TailPred == (struct Node *)&p->mp_MsgList);
+	Permit();
+
+	if (!empty || port_pool_n >= MAX_PORT_POOL)
+		return;
+
+	port_pool[port_pool_n++] = p;
+}
+
+/* ------------------------------------------------------------------ */
+/* A session whose client is gone, kept alive until its Shell has finished. */
+
+struct Reaper
+{
+	int                 in_use;
+	struct MsgPort     *port;
+	struct ConsoleState con;
+	ULONG               quiet_deadline;
+};
+
+static struct Reaper reapers[MAX_REAPERS];
+
+/* There is nothing to read from and nowhere to write to. Reporting EOF is what
+ * makes the Shell exit; accepting writes is what lets it get that far. */
+static long reaper_read(void *ctx, void *buf, long len)
+{
+	(void)ctx; (void)buf; (void)len;
+	return -1;
+}
+
+static long reaper_write(void *ctx, const void *buf, long len)
+{
+	(void)ctx; (void)buf;
+	return len;
+}
 
 /*
  * READY HANDSHAKE.
@@ -529,6 +661,138 @@ static struct FileHandle *make_handle(struct MsgPort *port, LONG mode, LONG id)
  * once, which matters because a second caller previously connected and then
  * silently received nothing at all.                                    */
 
+/*
+ * Answer everything queued on one console port.
+ *
+ * Shared by live sessions and reapers on purpose: a Shell winding down opens
+ * and closes handles exactly as a live one does, and two copies of this loop
+ * would eventually disagree about how to complete an open.
+ *
+ * `deferred` may be NULL, meaning this caller cannot hold a packet back; a
+ * read that would block is then answered EOF instead.
+ */
+static long service_port(struct MsgPort *port, struct ConsoleState *con,
+                         struct DosPacket **deferred, long *ndef, long maxdef)
+{
+	struct Message *msg;
+	long handled = 0;
+
+	while ((msg = GetMsg(port)) != NULL)
+	{
+		handled++;
+		struct DosPacket *pkt = (struct DosPacket *)msg->mn_Node.ln_Name;
+		struct ConsoleReply r;
+		void *bufarg = NULL;
+		LONG  len = 0;
+
+		if (pkt == NULL)
+			continue;
+
+		if (pkt->dp_Type == ACTION_READ || pkt->dp_Type == ACTION_WRITE)
+		{
+			bufarg = (void *)pkt->dp_Arg2;
+			len    = pkt->dp_Arg3;
+		}
+
+		r = console_dispatch(con, pkt->dp_Type, pkt->dp_Arg1,
+		                     pkt->dp_Arg2, bufarg, len);
+
+		if (r.defer)
+		{
+			if (deferred && *ndef < maxdef)
+			{
+				deferred[(*ndef)++] = pkt;
+				continue;
+			}
+			r.res1 = 0;	/* nowhere to hold it: EOF beats losing it */
+			r.res2 = 0;
+		}
+
+		/* Complete an open the way a real handler does
+		 * (ahi-handler/main.c:330-331). fh_Interactive is what makes
+		 * NewShell accept the stream as a console at all. */
+		if (r.res1 == DOSTRUE
+		    && (pkt->dp_Type == ACTION_FINDINPUT
+		     || pkt->dp_Type == ACTION_FINDOUTPUT
+		     || pkt->dp_Type == ACTION_FINDUPDATE))
+		{
+			struct FileHandle *nfh =
+				(struct FileHandle *)BADDR((BPTR)pkt->dp_Arg1);
+			if (nfh)
+			{
+				nfh->fh_Arg1        = HANDLE_OPEN;
+				nfh->fh_Interactive = DOSTRUE;
+			}
+		}
+
+		ReplyPkt(pkt, r.res1, r.res2);
+	}
+
+	return handled;
+}
+
+/*
+ * Hand a departing session's console to a reaper.
+ *
+ * The console state is copied verbatim -- the handle count is the whole point,
+ * since it is what says when the Shell has let go -- and only the two ends of
+ * it are rebound to a reaper that reads EOF and swallows output.
+ */
+static int reaper_available(void)
+{
+	int i;
+
+	for (i = 0; i < MAX_REAPERS; i++)
+		if (!reapers[i].in_use)
+			return 1;
+	return 0;
+}
+
+static int reaper_adopt(struct Session *s)
+{
+	int i;
+
+	if (s->port == NULL)
+		return 0;
+
+	for (i = 0; i < MAX_REAPERS; i++)
+		if (!reapers[i].in_use)
+			break;
+	if (i == MAX_REAPERS)
+		return 0;
+
+	reapers[i].port     = s->port;
+	reapers[i].con      = s->con;		/* struct copy, accounting included */
+	reapers[i].con.read_fn  = reaper_read;
+	reapers[i].con.write_fn = reaper_write;
+	reapers[i].con.io_ctx   = &reapers[i];
+	reapers[i].con.draining = 1;
+	reapers[i].quiet_deadline = now_secs() + REAPER_QUIET_SECS;
+	reapers[i].in_use   = 1;
+
+	say("telnetd: console handed to a reaper; its shell has not exited yet\n");
+	return 1;
+}
+
+static void reaper_service(struct Reaper *r)
+{
+	int done;
+
+	if (service_port(r->port, &r->con, NULL, NULL, 0) > 0)
+		r->quiet_deadline = now_secs() + REAPER_QUIET_SECS;
+
+	done = console_session_finished(&r->con)
+	    || (!r->con.established && now_secs() >= r->quiet_deadline);
+
+	if (done)
+	{
+		port_put(r->port);
+		r->port   = NULL;
+		r->in_use = 0;
+		say("telnetd: reaped a console; its port is available again\n");
+	}
+}
+
 static void session_end(struct Session *s)
 {
 	/* Anything still held must be answered or the Shell waits forever. */
@@ -540,12 +804,22 @@ static void session_end(struct Session *s)
 	s->devnode = NULL;
 
 	/*
-	 * The message port is deliberately NOT freed. Freeing one a Shell may
-	 * still hold a handle to takes down the OS rather than failing politely,
-	 * and the only thing that could vouch for it being safe is our own
-	 * packet accounting -- the code under test. A leaked port costs a few
-	 * hundred bytes until reboot; nothing is reclaimed at exit here anyway.
+	 * The port is still never FREED -- freeing one a Shell might hold takes
+	 * the machine down rather than failing politely, and our own packet
+	 * accounting is the only thing that could vouch for it. But it is no
+	 * longer simply abandoned either, because abandoning it leaked a signal
+	 * bit and stranded whatever was still writing to it.
+	 *
+	 * Finished cleanly: recycle it, which is a weaker claim than freeing --
+	 * the memory stays valid and stays ours either way.
+	 * Not finished: a reaper keeps answering it until the Shell lets go.
 	 */
+	if (s->helper_done && console_session_finished(&s->con))
+		port_put(s->port);
+	else if (!reaper_adopt(s))
+		say("telnetd: no reaper free -- abandoning a console port\n");
+	s->port = NULL;
+
 	if (s->helper_done)
 	{
 		if (s->replyport) DeleteMsgPort(s->replyport);
@@ -561,11 +835,29 @@ static void session_end(struct Session *s)
 	say("telnetd: session ended\n");
 }
 
-/* True once there is nothing left to serve. */
+/*
+ * True once there is nothing left to serve.
+ *
+ * `|| s->peer_gone` used to be part of this, and it was wrong. helper_done
+ * goes true seconds into a session -- "NewShell <window>" returns once it has
+ * LAUNCHED the shell, not when that shell exits -- so a disconnect made this
+ * true immediately, while the Shell still held open handles. Its remaining
+ * packets then went to a port nobody read again and it blocked forever.
+ *
+ * A dead peer is handled where it belongs instead: reads report EOF, the Shell
+ * exits, and if it takes longer than DRAIN_GRACE_SECS a reaper finishes the
+ * job so the session slot is not held hostage.
+ */
 static int session_finished(struct Session *s)
 {
-	return s->helper_done
-	    && (console_session_finished(&s->con) || s->peer_gone);
+	return s->helper_done && console_session_finished(&s->con);
+}
+
+static int session_expired(struct Session *s)
+{
+	return s->peer_gone
+	    && s->drain_deadline != 0
+	    && now_secs() >= s->drain_deadline;
 }
 
 static int session_start(struct Session *s, LONG sock, LONG session_no)
@@ -610,7 +902,7 @@ static int session_start(struct Session *s, LONG sock, LONG session_no)
 		*d = '\0';
 	}
 
-	s->port      = CreateMsgPort();
+	s->port      = port_get();
 	s->replyport = CreateMsgPort();
 	s->sm        = AllocVec(sizeof(struct SpawnMsg), MEMF_PUBLIC | MEMF_CLEAR);
 	s->fh_in     = s->port ? make_handle(s->port, MODE_OLDFILE,  HANDLE_IN)  : NULL;
@@ -690,12 +982,22 @@ static int session_start(struct Session *s, LONG sock, LONG session_no)
 	return 1;
 
 fail:
-	/* Reachable only before any Shell exists, so these really are ours. */
+	/* Reachable only before any Shell exists, so these really are ours.
+	 *
+	 * The DOS entry goes first. CreateNewProc() failing left it published
+	 * with dol_Task pointing at a port this same path then deleted, so
+	 * anything that so much as listed the device -- or the session 26 logins
+	 * later that reused the letter -- would have sent a packet into freed
+	 * memory. */
+	if (s->devnode && RemDosEntry(s->devnode))
+		FreeDosEntry(s->devnode);
+	s->devnode = NULL;
+
 	if (s->fh_in)     FreeDosObject(DOS_FILEHANDLE, s->fh_in);
 	if (s->fh_out)    FreeDosObject(DOS_FILEHANDLE, s->fh_out);
 	if (s->sm)        FreeVec(s->sm);
 	if (s->replyport) DeleteMsgPort(s->replyport);
-	if (s->port)      DeleteMsgPort(s->port);
+	if (s->port)      port_put(s->port);
 	if (s->sock >= 0) CloseSocket(s->sock);
 	memset(s, 0, sizeof(*s));
 	s->sock = -1;
@@ -705,7 +1007,6 @@ fail:
 /* One slice of work: whatever this session can do without blocking. */
 static void session_service(struct Session *s, int readable)
 {
-	struct Message *msg;
 	long i;
 
 	if (s->sock >= 0 && readable)
@@ -721,7 +1022,8 @@ static void session_service(struct Session *s, int readable)
 		}
 		else if (got == 0)
 		{
-			s->peer_gone = 1;
+			s->peer_gone      = 1;
+			s->drain_deadline = now_secs() + DRAIN_GRACE_SECS;
 			console_begin_drain(&s->con);
 			say("telnetd: peer closed; draining\n");
 		}
@@ -741,54 +1043,7 @@ static void session_service(struct Session *s, int readable)
 		s->deferred[i] = s->deferred[--s->ndef];
 	}
 
-	while ((msg = GetMsg(s->port)) != NULL)
-	{
-		struct DosPacket *pkt = (struct DosPacket *)msg->mn_Node.ln_Name;
-		struct ConsoleReply r;
-		void *bufarg = NULL;
-		LONG  len = 0;
-
-		if (pkt == NULL)
-			continue;
-
-		if (pkt->dp_Type == ACTION_READ || pkt->dp_Type == ACTION_WRITE)
-		{
-			bufarg = (void *)pkt->dp_Arg2;
-			len    = pkt->dp_Arg3;
-		}
-
-		r = console_dispatch(&s->con, pkt->dp_Type, pkt->dp_Arg1,
-		                     pkt->dp_Arg2, bufarg, len);
-
-		if (r.defer)
-		{
-			if (s->ndef < MAX_DEFERRED)
-			{
-				s->deferred[s->ndef++] = pkt;
-				continue;
-			}
-			r.res1 = 0;	/* out of room: EOF beats losing the packet */
-		}
-
-		/* Complete an open the way a real handler does
-		 * (ahi-handler/main.c:330-331). fh_Interactive is what makes
-		 * NewShell accept the stream as a console at all. */
-		if (r.res1 == DOSTRUE
-		    && (pkt->dp_Type == ACTION_FINDINPUT
-		     || pkt->dp_Type == ACTION_FINDOUTPUT
-		     || pkt->dp_Type == ACTION_FINDUPDATE))
-		{
-			struct FileHandle *nfh =
-				(struct FileHandle *)BADDR((BPTR)pkt->dp_Arg1);
-			if (nfh)
-			{
-				nfh->fh_Arg1        = HANDLE_OPEN;
-				nfh->fh_Interactive = DOSTRUE;
-			}
-		}
-
-		ReplyPkt(pkt, r.res1, r.res2);
-	}
+	service_port(s->port, &s->con, s->deferred, &s->ndef, MAX_DEFERRED);
 
 	while (GetMsg(s->replyport) != NULL)
 	{
@@ -1115,7 +1370,7 @@ static void daemon_main(void)
 		struct timeval tv;
 		LONG sigs = SIGBREAKF_CTRL_C;
 		LONG nready, maxfd = listener;
-		int active = 0;
+		int active = 0, winding_down = 0;
 
 		FD_ZERO(&rd);
 		FD_SET(listener, &rd);
@@ -1131,11 +1386,28 @@ static void daemon_main(void)
 				FD_SET(s->sock, &rd);
 				if (s->sock > maxfd) maxfd = s->sock;
 			}
+			if (s->peer_gone) winding_down++;
 			if (s->port)      sigs |= (1UL << s->port->mp_SigBit);
 			if (s->replyport) sigs |= (1UL << s->replyport->mp_SigBit);
 		}
 
-		tv.tv_sec  = wait_secs > 0 ? wait_secs : 3600;
+		for (i = 0; i < MAX_REAPERS; i++)
+		{
+			if (!reapers[i].in_use || reapers[i].port == NULL)
+				continue;
+			winding_down++;
+			sigs |= (1UL << reapers[i].port->mp_SigBit);
+		}
+
+		/*
+		 * Sleep until something happens -- unless something is winding
+		 * down, in which case a deadline has to be checked and the wait
+		 * has to be short enough to reach it.
+		 */
+		if (winding_down)
+			tv.tv_sec = 1;
+		else
+			tv.tv_sec = wait_secs > 0 ? wait_secs : 3600;
 		tv.tv_usec = 0;
 
 		nready = WaitSelect(maxfd + 1, &rd, NULL, NULL, &tv, (ULONG *)&sigs);
@@ -1154,9 +1426,15 @@ static void daemon_main(void)
 				continue;
 			session_service(s, (nready > 0 && s->sock >= 0
 			                    && FD_ISSET(s->sock, &rd)));
-			if (session_finished(s))
+			if (session_finished(s)
+			    || (session_expired(s) && reaper_available()))
 				session_end(s);
 		}
+
+		/* Consoles whose clients are gone but whose shells are not. */
+		for (i = 0; i < MAX_REAPERS; i++)
+			if (reapers[i].in_use)
+				reaper_service(&reapers[i]);
 
 		/* A new caller, if there is room for one. */
 		if (nready > 0 && FD_ISSET(listener, &rd))
@@ -1191,7 +1469,7 @@ static void daemon_main(void)
 			continue;
 		}
 
-		if (nready == 0 && active == 0 && wait_secs > 0)
+		if (nready == 0 && active == 0 && winding_down == 0 && wait_secs > 0)
 		{
 			say("telnetd: no connection within the timeout; exiting\n");
 			break;
@@ -1201,6 +1479,20 @@ static void daemon_main(void)
 	for (i = 0; i < MAX_SESSIONS; i++)
 		if (sessions[i].in_use)
 			session_end(&sessions[i]);
+
+	/*
+	 * Every port left over has mp_SigTask pointing at this process, which
+	 * is about to stop existing. PA_IGNORE makes PutMsg enqueue and return
+	 * without signalling anyone, so a Shell that outlives us blocks
+	 * harmlessly instead of signalling freed memory -- the difference
+	 * between a stranded process and a dead machine.
+	 */
+	for (i = 0; i < MAX_REAPERS; i++)
+		if (reapers[i].in_use && reapers[i].port)
+			reapers[i].port->mp_Flags = PA_IGNORE;
+	for (i = 0; i < port_pool_n; i++)
+		if (port_pool[i])
+			port_pool[i]->mp_Flags = PA_IGNORE;
 
 	CloseSocket(listener);
 	if (UserGroupBase) CloseLibrary(UserGroupBase);
