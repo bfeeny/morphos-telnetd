@@ -101,25 +101,29 @@ struct ConsoleState
 	long unknown;	/* packets we did not recognise */
 
 	/*
-	 * ACTION_CHANGE_SIGNAL hands us the task that wants to be signalled --
-	 * on a real console this is how ^C reaches the running program. We spawn
-	 * the Shell through SystemTagList() and never get a Process pointer back,
-	 * so this packet is the only route to the identity we need in order to
-	 * turn telnet's Interrupt Process into SIGBREAKF_CTRL_C.
+	 * ACTION_CHANGE_SIGNAL -- how ^C reaches the program in the session.
 	 *
-	 * Measured on MorphOS 3.20 rather than inferred: the packet carries
-	 * three arguments, and it is dp_Arg2 that holds the task --
+	 * Documented in dos.library/AAA-Packet-Documentation, which is NOT in
+	 * the MorphOS SDK (it is on wiki.amigaos.net; mirrored locally under
+	 * Documentation/dos-packets/). Verbatim:
 	 *
-	 *   dp_Arg1 = 1            (constant across sessions)
-	 *   dp_Arg2 = 566435964, then 654606452 on the next session
-	 *   dp_Arg3 = 0
-	 *   our own task = 631194168
+	 *   "This packet redirects what process the console handler signals
+	 *    when the user hits Control-C, Control-D, Control-E, or Control-F."
 	 *
-	 * dp_Arg2 changes per client and sits in the same region as a known
-	 * task pointer; dp_Arg1 does not vary at all. Reading dp_Arg1 as the
-	 * task -- which this code did at first -- would have signalled 1.
+	 *   dp_Arg1 - filehandle->fh_Arg1 of the console file handle
+	 *   dp_Arg2 - (struct MsgPort *) MsgPort of the process to signal
+	 *   dp_Arg3 - (struct FileHandle *) added 53.49, previously 0
+	 *
+	 * dp_Arg2 IS A MsgPort, NOT A TASK. Measurement alone could not tell
+	 * them apart -- both are Exec structures from the same pools, so the
+	 * pointer looked task-shaped and was recorded here as a task. To signal
+	 * it, take port->mp_SigTask; signalling the port itself would not work.
+	 *
+	 * The measurements now all have explanations: dp_Arg1 was constant at 1
+	 * because it is OUR OWN fh_Arg1 coming back to us, and dp_Arg3 was
+	 * always 0 because MorphOS does not implement the 53.49 extension.
 	 */
-	void *signal_task;
+	void *signal_port;	/* struct MsgPort * -- signal port->mp_SigTask */
 	long  signals_seen;
 
 	/*

@@ -197,20 +197,20 @@ static void test_change_signal_is_accepted_and_recorded(void)
 	struct ConsoleState st;
 	struct FakeIO io;
 	struct ConsoleReply r;
-	long fake_task = 0x12345678;
+	long fake_port = 0x12345678;
 
-	printf("CHANGE_SIGNAL is accepted, and the task is kept\n");
+	printf("CHANGE_SIGNAL is accepted, and the MsgPort is kept\n");
 	setup(&st, &io, "");
 
-	r = console_dispatch(&st, ACTION_CHANGE_SIGNAL, 1, fake_task, NULL, 0);
+	r = console_dispatch(&st, ACTION_CHANGE_SIGNAL, 1, fake_port, NULL, 0);
 	CHECK(r.res1 == DOSTRUE, "accepted, not refused as unknown");
 	CHECK(st.unknown == 0, "not counted as unknown");
-	CHECK(st.signal_task == (void *)fake_task, "dp_Arg2 recorded -- this is the ^C target");
+	CHECK(st.signal_port == (void *)fake_port, "dp_Arg2 recorded -- the MsgPort to signal on ^C");
 	CHECK(st.signals_seen == 1, "counted");
 
 	/* A zero task must not wipe a good one. */
 	console_dispatch(&st, ACTION_CHANGE_SIGNAL, 1, 0, NULL, 0);
-	CHECK(st.signal_task == (void *)fake_task, "a null task does not clear it");
+	CHECK(st.signal_port == (void *)fake_port, "a null port does not clear it");
 }
 
 /* ---- the ones that actually matter ------------------------------------- */

@@ -737,40 +737,56 @@ static void daemon_main(void);
 /*
  * Background ourselves, properly.
  *
- * `Run` is an AmigaDOS command and pdksh does not resolve it -- the line
- * silently evaporates. Backgrounding with the shell's own `&` starts the
- * process but leaves it without a usable context: with authentication enabled
- * it then reaches neither listen() nor its log, while still appearing in
- * Status. A daemon that only works in the foreground cannot be started at boot,
- * which is the whole point of having one.
+ * `Run` is an AmigaDOS command that pdksh does not resolve -- the line silently
+ * evaporates. The shell's own `&` starts a process that, with authentication
+ * enabled, never binds at all.
  *
- * So the daemon detaches itself: it spawns a proper DOS process for the real
- * work and returns immediately, which is the Amiga idiom and does not depend on
- * whatever shell happened to launch it.
+ * The obvious fix -- CreateNewProc() on a function in this image -- is worse
+ * than it looks, and cost several hardware runs to understand. The child shares
+ * this program's GLOBALS, including the library bases libnix opened at startup.
+ * When the parent's main() returns, libnix's exit code CLOSES those bases. The
+ * child is then holding a closed dos.library, so every DOS call it makes fails
+ * while its own bsdsocket calls keep working -- which is exactly what was
+ * observed: the port bound and listened, and nothing else worked, not even
+ * writing a log file.
+ *
+ * So the daemon re-launches the BINARY, not a function: a fresh image gets its
+ * own startup code and its own library bases and does not care what happens to
+ * this process. SYS_Asynch means System() returns immediately and the new
+ * program owns the handles it was given.
  */
-static int detach(void)
+static int detach(CONST_STRPTR self, int argc, char **argv)
 {
-	struct TagItem tags[7];
+	char cmd[512];
+	int n = 0, i;
+	struct TagItem systags[4];
+	BPTR nil_in, nil_out;
 
-	tags[0].ti_Tag = NP_CodeType;  tags[0].ti_Data = CODETYPE_PPC;
-	tags[1].ti_Tag = NP_Entry;     tags[1].ti_Data = (IPTR)daemon_main;
-	tags[2].ti_Tag = NP_Name;      tags[2].ti_Data = (IPTR)"telnetd";
-	tags[3].ti_Tag = NP_WindowPtr; tags[3].ti_Data = (IPTR)-1;
-	/* Its own console handles, so it does not die with the launching shell
-	 * and does not hold that shell's streams open. */
-	tags[4].ti_Tag = NP_Input;     tags[4].ti_Data = (IPTR)0;
-	/*
-	 * A generous stack. CreateNewProc's default is small, and this process
-	 * runs the whole daemon: fd_sets, a kilobyte receive buffer, the login
-	 * dialogue's line buffers, and WaitSelect on top. On a machine with no
-	 * memory protection a stack overflow does not fault cleanly -- it
-	 * quietly corrupts whatever is next -- so the failure would look like
-	 * anything except its cause.
-	 */
-	tags[5].ti_Tag = NP_StackSize; tags[5].ti_Data = (IPTR)65536;
-	tags[6].ti_Tag = TAG_DONE;     tags[6].ti_Data = 0;
+	/* Rebuild our own command line without -d, so the child does not
+	 * detach again and fork indefinitely. */
+	{
+		const char *p = (const char *)self;
+		while (*p && n < (int)sizeof(cmd) - 2) cmd[n++] = *p++;
+	}
+	for (i = 1; i < argc && n < (int)sizeof(cmd) - 2; i++)
+	{
+		const char *a = argv[i];
+		if (a[0] == '-' && a[1] == 'd')
+			continue;
+		cmd[n++] = ' ';
+		while (*a && n < (int)sizeof(cmd) - 2) cmd[n++] = *a++;
+	}
+	cmd[n] = '\0';
 
-	return CreateNewProc(tags) != NULL;
+	nil_in  = Open((CONST_STRPTR)"NIL:", MODE_OLDFILE);
+	nil_out = Open((CONST_STRPTR)"NIL:", MODE_NEWFILE);
+
+	systags[0].ti_Tag = SYS_Input;  systags[0].ti_Data = (IPTR)nil_in;
+	systags[1].ti_Tag = SYS_Output; systags[1].ti_Data = (IPTR)nil_out;
+	systags[2].ti_Tag = SYS_Asynch; systags[2].ti_Data = (IPTR)TRUE;
+	systags[3].ti_Tag = TAG_DONE;   systags[3].ti_Data = 0;
+
+	return SystemTagList((CONST_STRPTR)cmd, systags) != -1;
 }
 
 int main(int argc, char **argv)
@@ -823,7 +839,11 @@ int main(int argc, char **argv)
 		 * The log is opened by the CHILD, not here: this process is
 		 * about to exit and a file handle it owns would go with it.
 		 */
-		if (!detach())
+		CONST_STRPTR self = (argc > 0 && argv[0] && argv[0][0])
+		                    ? (CONST_STRPTR)argv[0]
+		                    : (CONST_STRPTR)"telnetd";
+
+		if (!detach(self, argc, argv))
 		{
 			say("telnetd: could not detach\n");
 			return RETURN_FAIL;
