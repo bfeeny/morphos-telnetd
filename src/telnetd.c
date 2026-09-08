@@ -1013,8 +1013,25 @@ static long service_port(struct MsgPort *port, struct ConsoleState *con,
 			len    = pkt->dp_Arg3;
 		}
 
-		r = console_dispatch(con, pkt->dp_Type, pkt->dp_Arg1,
-		                     pkt->dp_Arg2, bufarg, len);
+		{
+			long before = con->unknown;
+
+			r = console_dispatch(con, pkt->dp_Type, pkt->dp_Arg1,
+			                     pkt->dp_Arg2, bufarg, len);
+
+			/*
+			 * Name every packet we could not answer.
+			 *
+			 * The console layer counts them; nothing ever said WHICH,
+			 * so a program that failed here failed silently and looked
+			 * like a platform limit. An ixemul binary asks for things
+			 * a Shell never does, and this is the only place that can
+			 * tell us what they were.
+			 */
+			if (con->unknown != before)
+				say_num("telnetd: unanswered packet, dp_Type = ",
+				        (LONG)pkt->dp_Type);
+		}
 
 		if (r.defer)
 		{
