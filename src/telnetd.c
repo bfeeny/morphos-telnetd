@@ -1565,12 +1565,34 @@ int main(int argc, char **argv)
 			return RETURN_FAIL;
 		}
 
-		/* Up to ten seconds for the child to reach listen(). */
-		for (waited = 0; waited < 50 && !ok; waited++)
+		/*
+		 * Wait for the child to reach listen().
+		 *
+		 * This was a flat ten seconds, which stopped being right the
+		 * moment -n existed: the child may spend up to cfg_netwait
+		 * seconds waiting for the network stack BEFORE it binds, and
+		 * the two numbers did not know about each other. At boot, with
+		 * -n 60 and a stack that took twelve seconds to appear, the
+		 * parent gave up and announced "started but never began
+		 * listening -- port already in use?" while the daemon came up
+		 * perfectly well a moment later. Both halves of that sentence
+		 * were false, and reporting a working daemon as a failed one is
+		 * the same dishonesty this handshake exists to prevent, just
+		 * pointing the other way.
+		 *
+		 * The parent parsed the same argv, so it already knows the
+		 * number. Ten seconds of margin on top, for the bind and listen
+		 * themselves.
+		 */
 		{
-			Delay(10);	/* 1/5 second */
-			if (GetMsg(ready) != NULL)
-				ok = 1;
+			int limit = (int)(cfg_netwait + 10) * 5;	/* 1/5s ticks */
+
+			for (waited = 0; waited < limit && !ok; waited++)
+			{
+				Delay(10);	/* 1/5 second */
+				if (GetMsg(ready) != NULL)
+					ok = 1;
+			}
 		}
 
 		RemPort(ready);
@@ -1587,7 +1609,9 @@ int main(int argc, char **argv)
 		 * can tell "someone beat me to this port, stand down" from
 		 * "something is wrong, raise an alarm".
 		 */
-		say("telnetd: started but never began listening -- port already in use?\n");
+		say("telnetd: started but never began listening.\n");
+		say("telnetd: the port may be in use, or the network stack may not be up\n");
+		say("telnetd: (see -n). The child's own log, if -l was given, will say which.\n");
 		return RETURN_ERROR;
 	}
 
