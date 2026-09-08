@@ -720,16 +720,132 @@ static void session_service(struct Session *s, int readable)
 
 /* ------------------------------------------------------------------ */
 
+/*
+ * Configuration, held where a detached child can reach it.
+ *
+ * Parent and child share one address space on MorphOS, so the child reads what
+ * the parent parsed. Nothing is passed through the startup message because
+ * nothing needs to be: there is only ever one daemon per process image.
+ */
+static LONG         cfg_port      = DEFAULT_PORT;
+static LONG         cfg_wait      = 0;
+static CONST_STRPTR cfg_bind      = NULL;
+static CONST_STRPTR cfg_logfile   = NULL;
+
+static void daemon_main(void);
+
+/*
+ * Background ourselves, properly.
+ *
+ * `Run` is an AmigaDOS command and pdksh does not resolve it -- the line
+ * silently evaporates. Backgrounding with the shell's own `&` starts the
+ * process but leaves it without a usable context: with authentication enabled
+ * it then reaches neither listen() nor its log, while still appearing in
+ * Status. A daemon that only works in the foreground cannot be started at boot,
+ * which is the whole point of having one.
+ *
+ * So the daemon detaches itself: it spawns a proper DOS process for the real
+ * work and returns immediately, which is the Amiga idiom and does not depend on
+ * whatever shell happened to launch it.
+ */
+static int detach(void)
+{
+	struct TagItem tags[7];
+
+	tags[0].ti_Tag = NP_CodeType;  tags[0].ti_Data = CODETYPE_PPC;
+	tags[1].ti_Tag = NP_Entry;     tags[1].ti_Data = (IPTR)daemon_main;
+	tags[2].ti_Tag = NP_Name;      tags[2].ti_Data = (IPTR)"telnetd";
+	tags[3].ti_Tag = NP_WindowPtr; tags[3].ti_Data = (IPTR)-1;
+	/* Its own console handles, so it does not die with the launching shell
+	 * and does not hold that shell's streams open. */
+	tags[4].ti_Tag = NP_Input;     tags[4].ti_Data = (IPTR)0;
+	/*
+	 * A generous stack. CreateNewProc's default is small, and this process
+	 * runs the whole daemon: fd_sets, a kilobyte receive buffer, the login
+	 * dialogue's line buffers, and WaitSelect on top. On a machine with no
+	 * memory protection a stack overflow does not fault cleanly -- it
+	 * quietly corrupts whatever is next -- so the failure would look like
+	 * anything except its cause.
+	 */
+	tags[5].ti_Tag = NP_StackSize; tags[5].ti_Data = (IPTR)65536;
+	tags[6].ti_Tag = TAG_DONE;     tags[6].ti_Data = 0;
+
+	return CreateNewProc(tags) != NULL;
+}
+
 int main(int argc, char **argv)
+{
+	struct Process *me;
+	int detach_me = 0;
+	int i;
+
+	me = (struct Process *)FindTask(NULL);
+	if (me)
+		me->pr_WindowPtr = (APTR)-1;
+
+	for (i = 1; i < argc; i++)
+	{
+		if (argv[i][0] == '-' && argv[i][1] == 'p' && i + 1 < argc)
+		{
+			LONG v = 0;
+			CONST_STRPTR q = (CONST_STRPTR)argv[++i];
+			while (*q >= '0' && *q <= '9') v = v * 10 + (*q++ - '0');
+			if (v > 0) cfg_port = v;
+		}
+		else if (argv[i][0] == '-' && argv[i][1] == 'b' && i + 1 < argc)
+		{
+			cfg_bind = (CONST_STRPTR)argv[++i];
+		}
+		else if (argv[i][0] == '-' && argv[i][1] == 'a')
+		{
+			allow_no_auth = 1;
+		}
+		else if (argv[i][0] == '-' && argv[i][1] == 'd')
+		{
+			detach_me = 1;
+		}
+		else if (argv[i][0] == '-' && argv[i][1] == 'l' && i + 1 < argc)
+		{
+			cfg_logfile = (CONST_STRPTR)argv[++i];
+		}
+		else if (argv[i][0] == '-' && argv[i][1] == 't' && i + 1 < argc)
+		{
+			LONG v = 0;
+			CONST_STRPTR q = (CONST_STRPTR)argv[++i];
+			while (*q >= '0' && *q <= '9') v = v * 10 + (*q++ - '0');
+			cfg_wait = v;
+		}
+	}
+
+	if (detach_me)
+	{
+		/*
+		 * The log is opened by the CHILD, not here: this process is
+		 * about to exit and a file handle it owns would go with it.
+		 */
+		if (!detach())
+		{
+			say("telnetd: could not detach\n");
+			return RETURN_FAIL;
+		}
+		say("telnetd: detached; running in the background\n");
+		return RETURN_OK;
+	}
+
+	daemon_main();
+	return RETURN_OK;
+}
+
+static void daemon_main(void)
 {
 	struct sockaddr_in addr;
 	struct Process *me;
 	LONG listener;
 	LONG yes = 1;
-	LONG port_no = DEFAULT_PORT;
-	LONG wait_secs = 0;	/* 0 == wait indefinitely */
+	LONG port_no = cfg_port;
+	LONG wait_secs = cfg_wait;
 	LONG session_no = 0;
-	CONST_STRPTR bind_addr = NULL;	/* NULL == all interfaces */
+	CONST_STRPTR bind_addr = cfg_bind;
 	int i;
 
 	me = (struct Process *)FindTask(NULL);
@@ -739,41 +855,14 @@ int main(int argc, char **argv)
 	for (i = 0; i < MAX_SESSIONS; i++)
 		sessions[i].sock = -1;
 
-	for (i = 1; i < argc; i++)
-	{
-		if (argv[i][0] == '-' && argv[i][1] == 'p' && i + 1 < argc)
-		{
-			LONG v = 0;
-			CONST_STRPTR q = (CONST_STRPTR)argv[++i];
-			while (*q >= '0' && *q <= '9') v = v * 10 + (*q++ - '0');
-			if (v > 0) port_no = v;
-		}
-		else if (argv[i][0] == '-' && argv[i][1] == 'b' && i + 1 < argc)
-		{
-			bind_addr = (CONST_STRPTR)argv[++i];
-		}
-		else if (argv[i][0] == '-' && argv[i][1] == 'a')
-		{
-			allow_no_auth = 1;
-		}
-		else if (argv[i][0] == '-' && argv[i][1] == 'l' && i + 1 < argc)
-		{
-			logfh = Open((CONST_STRPTR)argv[++i], MODE_NEWFILE);
-		}
-		else if (argv[i][0] == '-' && argv[i][1] == 't' && i + 1 < argc)
-		{
-			LONG v = 0;
-			CONST_STRPTR q = (CONST_STRPTR)argv[++i];
-			while (*q >= '0' && *q <= '9') v = v * 10 + (*q++ - '0');
-			wait_secs = v;
-		}
-	}
+	if (cfg_logfile)
+		logfh = Open(cfg_logfile, MODE_NEWFILE);
 
 	SocketBase = OpenLibrary("bsdsocket.library", 4);
 	if (SocketBase == NULL)
 	{
 		say("telnetd: cannot open bsdsocket.library\n");
-		return RETURN_FAIL;
+		return;
 	}
 
 	UserGroupBase = OpenLibrary("usergroup.library", 0);
@@ -796,7 +885,7 @@ int main(int argc, char **argv)
 		say("telnetd: usergroup.library not available and no bypass given.\n");
 		say("telnetd: refusing to start rather than serve unauthenticated shells.\n");
 		CloseLibrary(SocketBase);
-		return RETURN_FAIL;
+		return;
 	}
 
 	listener = socket(AF_INET, SOCK_STREAM, 0);
@@ -804,7 +893,7 @@ int main(int argc, char **argv)
 	{
 		say("telnetd: socket() failed\n");
 		CloseLibrary(SocketBase);
-		return RETURN_FAIL;
+		return;
 	}
 
 	setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, (APTR)&yes, sizeof(yes));
@@ -819,7 +908,7 @@ int main(int argc, char **argv)
 		say("telnetd: bind() failed -- port in use?\n");
 		CloseSocket(listener);
 		CloseLibrary(SocketBase);
-		return RETURN_FAIL;
+		return;
 	}
 
 	/* A real backlog. With a backlog of 1 the kernel completed handshakes
@@ -830,7 +919,7 @@ int main(int argc, char **argv)
 		say("telnetd: listen() failed\n");
 		CloseSocket(listener);
 		CloseLibrary(SocketBase);
-		return RETURN_FAIL;
+		return;
 	}
 
 	say("telnetd: listening on ");
@@ -946,5 +1035,4 @@ int main(int argc, char **argv)
 	if (UserGroupBase) CloseLibrary(UserGroupBase);
 	CloseLibrary(SocketBase);
 	if (logfh) { say("telnetd: exit\n"); Close(logfh); logfh = 0; }
-	return RETURN_OK;
 }
