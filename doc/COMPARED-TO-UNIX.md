@@ -159,17 +159,26 @@ machines with `WANTYES`/`WANTNO` and queued transitions, which exists to make
 negotiation converge when both ends change their minds at once.
 
 This daemon offers exactly four things — `WILL ECHO`, `WILL SGA`, `DO NAWS`,
-`DO TTYPE` — refuses everything else with `DONT`/`WONT`, and keeps **no option
-state at all**. It cannot loop, because it never sends a request in response to
-a response. Agreement with something we offered is answered with silence, which
-RFC 854 requires ("acknowledgements must not be sent for a request already in
-effect").
+`DO TTYPE` — refuses everything else, and keeps **three states per option**
+(`NO`, `WANTYES`, `YES`) for those four only. That is RFC 1143 reduced to what
+is actually implemented, rather than the general machinery.
 
-**Where that is currently wrong:** `DONT` and `WONT` are not honoured. RFC 854
-requires that a request to *disable* always be accepted. A client sending
-`DONT ECHO` gets no `WONT` back and we keep echoing; a Q-method client is then
-stuck in `WANTNO` waiting for a reply that never comes, and characters double.
-This is a real conformance gap, tracked, and not yet fixed.
+The state earns its place on one distinction. An arriving `DONT` is either an
+**answer** to a `WILL` we sent — which needs no reply, or the two ends
+negotiate in circles — or a **demand** to stop something already in effect,
+which RFC 854 p.3 says must always be accepted with a `WONT`. Those are
+identical on the wire and differ only in what the receiver knows.
+
+Getting that wrong is not theoretical: `DONT` and `WONT` used to be ignored
+entirely, so a client that sent `DONT ECHO` got no answer, the daemon kept
+echoing, and a Q-method client sat in `WANTNO` waiting for a reply that never
+came — doubled characters, and no way for it to recover. The login echo now
+consults the option state, so a client that asks us to stop echoing is obeyed
+mid-session.
+
+Still simpler than BSD's in one respect worth naming: there is no **queue** for
+a transition requested while another is outstanding. With four options that are
+each offered exactly once at connect, that case does not arise.
 
 The parser itself is a **byte-at-a-time state machine** that can be suspended at
 any byte, because TCP does not respect message boundaries. busybox's telnetd
@@ -285,7 +294,7 @@ MorphOS Shell's path), including POSIX arithmetic and exit status.
 | Authentication | `exec /bin/login` | `usergroup.library` in-process |
 | Option state | RFC 1143 Q method | none; four offers, refuse the rest |
 | `^C` | `SIGINT` from the line discipline | **not implemented** |
-| `DONT`/`WONT` | honoured | **not honoured** |
+| `DONT`/`WONT` | honoured | honoured (RFC 1143 states, four options) |
 | `TERM` | negotiated and exported | negotiated, never asked for |
 | Resource cleanup | kernel, at exit | manual, for ever |
 | Session accounting | `utmp` / `wtmp` | none |

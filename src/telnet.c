@@ -45,6 +45,15 @@ void telnet_init(struct TelnetState *ts,
 	ts->sb_overflow = 0;
 	ts->commands = 0;
 	ts->out_cr_held = 0;
+	ts->us_echo = ts->us_sga = OPT_NO;
+	ts->him_naws = ts->him_ttype = OPT_NO;
+}
+
+int telnet_should_echo(const struct TelnetState *ts)
+{
+	/* WANTYES counts as yes: we echo from the moment we offer, and only
+	 * stop if the client actually objects. */
+	return ts->us_echo != OPT_NO;
 }
 
 static void raw_out(struct TelnetState *ts, const unsigned char *b, long n)
@@ -70,6 +79,105 @@ void telnet_start(struct TelnetState *ts)
 	};
 
 	raw_out(ts, hello, (long)sizeof(hello));
+
+	ts->us_echo   = OPT_WANTYES;
+	ts->us_sga    = OPT_WANTYES;
+	ts->him_naws  = OPT_WANTYES;
+	ts->him_ttype = OPT_WANTYES;
+}
+
+/* Defined below; declared here because the negotiation table uses it. */
+static void refuse(struct TelnetState *ts, unsigned char verb, unsigned char opt);
+
+/* Which state variable, if any, tracks this option? */
+static unsigned char *us_slot(struct TelnetState *ts, unsigned char opt)
+{
+	if (opt == OPT_ECHO) return &ts->us_echo;
+	if (opt == OPT_SGA)  return &ts->us_sga;
+	return 0;
+}
+
+static unsigned char *him_slot(struct TelnetState *ts, unsigned char opt)
+{
+	if (opt == OPT_NAWS)  return &ts->him_naws;
+	if (opt == OPT_TTYPE) return &ts->him_ttype;
+	return 0;
+}
+
+/*
+ * RFC 1143 §3, reduced to the four options this daemon implements.
+ *
+ * The rule that used to be missing is RFC 854 p.3: a request to DISABLE must
+ * always be accepted. DONT and WONT were ignored entirely, so a client that
+ * sent DONT ECHO got no WONT back, we carried on echoing, and a Q-method client
+ * sat in WANTNO waiting for a reply that never came -- doubled characters, and
+ * no way for it to recover.
+ *
+ * The state is what makes a correct answer possible: an arriving DONT is either
+ * an ANSWER to a WILL we sent (no reply -- replying would negotiate in circles)
+ * or a DEMAND to stop something already in effect (reply WONT). Those look
+ * identical on the wire and differ only in what we know.
+ */
+static void negotiate(struct TelnetState *ts, unsigned char verb, unsigned char opt)
+{
+	unsigned char *mine = us_slot(ts, opt);
+	unsigned char *his  = him_slot(ts, opt);
+
+	switch (verb)
+	{
+	case DO:
+		if (!mine)			/* not ours to perform */
+		{
+			refuse(ts, WONT, opt);
+			return;
+		}
+		if (*mine == OPT_WANTYES)  *mine = OPT_YES;	/* our offer, agreed */
+		else if (*mine == OPT_NO)			/* unsolicited ask */
+		{
+			*mine = OPT_YES;
+			refuse(ts, WILL, opt);			/* accept it */
+		}
+		/* already YES: silence, or we negotiate in circles */
+		break;
+
+	case DONT:
+		if (!mine)
+			return;		/* not doing it; nothing to turn off */
+		if (*mine == OPT_YES)
+		{
+			*mine = OPT_NO;
+			refuse(ts, WONT, opt);	/* a demand: must be accepted */
+		}
+		else if (*mine == OPT_WANTYES)
+			*mine = OPT_NO;		/* an answer: no reply */
+		break;
+
+	case WILL:
+		if (!his)
+		{
+			refuse(ts, DONT, opt);
+			return;
+		}
+		if (*his == OPT_WANTYES) *his = OPT_YES;
+		else if (*his == OPT_NO)
+		{
+			*his = OPT_YES;
+			refuse(ts, DO, opt);
+		}
+		break;
+
+	case WONT:
+		if (!his)
+			return;
+		if (*his == OPT_YES)
+		{
+			*his = OPT_NO;
+			refuse(ts, DONT, opt);
+		}
+		else if (*his == OPT_WANTYES)
+			*his = OPT_NO;
+		break;
+	}
 }
 
 /* Refuse anything we did not ask for, rather than ignoring it. A client that
@@ -173,21 +281,7 @@ long telnet_input(struct TelnetState *ts,
 			break;
 
 		case TS_VERB:
-			/*
-			 * We asked for exactly four things. Anything else is
-			 * refused; agreement with what we offered needs no reply,
-			 * or we would negotiate in circles.
-			 */
-			if (ts->pending_verb == WILL)
-			{
-				if (c != OPT_NAWS && c != OPT_TTYPE)
-					refuse(ts, DONT, c);
-			}
-			else if (ts->pending_verb == DO)
-			{
-				if (c != OPT_ECHO && c != OPT_SGA)
-					refuse(ts, WONT, c);
-			}
+			negotiate(ts, ts->pending_verb, c);
 			ts->state = TS_DATA;
 			break;
 

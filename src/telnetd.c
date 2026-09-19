@@ -881,7 +881,7 @@ static void login_consume(struct Session *s)
 			if (s->login_n > 0)
 			{
 				s->login_n--;
-				if (user)
+				if (user && telnet_should_echo(&s->tn))
 					net_write_str(s, (CONST_STRPTR)"\b \b");
 			}
 			continue;
@@ -893,7 +893,13 @@ static void login_consume(struct Session *s)
 		if (s->login_n < max - 1)
 		{
 			field[s->login_n++] = (char)c;
-			if (user)
+			/*
+			 * Only if the client still wants us to. We offer WILL
+			 * ECHO and echo from the start, but a client may send
+			 * DONT ECHO -- and echoing anyway gives it doubled
+			 * characters it has no way to stop.
+			 */
+			if (user && telnet_should_echo(&s->tn))
 				telnet_output(&s->tn, &c, 1);
 		}
 	}

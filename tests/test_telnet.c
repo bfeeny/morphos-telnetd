@@ -266,6 +266,125 @@ static void test_output_255_and_newline_together(void)
 	CHECK(s.out[4] == 255 && s.out[5] == 255, "trailing IAC doubled");
 }
 
+/*
+ * RFC 854 p.3: a request to DISABLE an option must ALWAYS be accepted.
+ * RFC 1143 3: from YES, receiving DONT means send WONT and go to NO.
+ *
+ * These were ignored entirely. A client that sent DONT ECHO got no answer, we
+ * kept echoing, and a Q-method client sat in WANTNO waiting for a WONT that
+ * never came -- doubled characters with no way to recover.
+ */
+static void test_dont_after_agreement_is_honoured(void)
+{
+	struct TelnetState ts; struct Sink s;
+	const unsigned char agree[] = { 255, 253, 1 };	/* IAC DO ECHO */
+	const unsigned char stop[]  = { 255, 254, 1 };	/* IAC DONT ECHO */
+	unsigned char out[16];
+
+	printf("DONT ECHO after agreement is answered WONT, and we stop echoing\n");
+	setup(&ts, &s);
+	telnet_start(&ts);
+
+	telnet_input(&ts, agree, 3, out, sizeof(out));
+	CHECK(ts.us_echo == OPT_YES, "DO ECHO puts the option in effect");
+	CHECK(telnet_should_echo(&ts) == 1, "so we echo");
+
+	s.out_len = 0;
+	telnet_input(&ts, stop, 3, out, sizeof(out));
+	CHECK(ts.us_echo == OPT_NO, "DONT ECHO turns it off");
+	CHECK(telnet_should_echo(&ts) == 0, "and we stop echoing");
+	CHECK(s.out_len == 3, "exactly one reply");
+	CHECK(s.out[1] == 252 && s.out[2] == 1, "which is WONT ECHO");
+}
+
+/*
+ * The same DONT arriving as an ANSWER to our own WILL needs no reply -- that is
+ * the distinction the state exists for. Replying would negotiate in circles.
+ */
+static void test_dont_answering_our_offer_is_silent(void)
+{
+	struct TelnetState ts; struct Sink s;
+	const unsigned char stop[] = { 255, 254, 1 };	/* IAC DONT ECHO */
+	unsigned char out[16];
+
+	printf("DONT answering our own WILL is silent, not a reply loop\n");
+	setup(&ts, &s);
+	telnet_start(&ts);
+	CHECK(ts.us_echo == OPT_WANTYES, "our offer is outstanding");
+
+	s.out_len = 0;
+	telnet_input(&ts, stop, 3, out, sizeof(out));
+	CHECK(ts.us_echo == OPT_NO, "refused, so the option is off");
+	CHECK(s.out_len == 0, "and we say nothing back");
+}
+
+static void test_wont_for_an_option_he_was_doing(void)
+{
+	struct TelnetState ts; struct Sink s;
+	const unsigned char will[] = { 255, 251, 31 };	/* IAC WILL NAWS */
+	const unsigned char wont[] = { 255, 252, 31 };	/* IAC WONT NAWS */
+	unsigned char out[16];
+
+	printf("WONT NAWS after agreement is answered DONT\n");
+	setup(&ts, &s);
+	telnet_start(&ts);
+
+	telnet_input(&ts, will, 3, out, sizeof(out));
+	CHECK(ts.him_naws == OPT_YES, "he is sending window size");
+
+	s.out_len = 0;
+	telnet_input(&ts, wont, 3, out, sizeof(out));
+	CHECK(ts.him_naws == OPT_NO, "and then stops");
+	CHECK(s.out_len == 3 && s.out[1] == 254 && s.out[2] == 31, "answered DONT NAWS");
+}
+
+static void test_unsolicited_do_is_accepted_not_ignored(void)
+{
+	struct TelnetState ts; struct Sink s;
+	const unsigned char stop[] = { 255, 254, 1 };
+	const unsigned char again[] = { 255, 253, 1 };
+	unsigned char out[16];
+
+	printf("a fresh DO after a DONT re-enables the option, with a WILL\n");
+	setup(&ts, &s);
+	telnet_start(&ts);
+	telnet_input(&ts, stop, 3, out, sizeof(out));	/* -> NO */
+
+	s.out_len = 0;
+	telnet_input(&ts, again, 3, out, sizeof(out));
+	CHECK(ts.us_echo == OPT_YES, "back in effect");
+	CHECK(s.out_len == 3 && s.out[1] == 251 && s.out[2] == 1, "acknowledged WILL ECHO");
+}
+
+static void test_repeat_agreement_is_silent(void)
+{
+	struct TelnetState ts; struct Sink s;
+	const unsigned char agree[] = { 255, 253, 1 };
+	unsigned char out[16];
+
+	printf("DO ECHO twice is answered once, never in a loop\n");
+	setup(&ts, &s);
+	telnet_start(&ts);
+	telnet_input(&ts, agree, 3, out, sizeof(out));
+	s.out_len = 0;
+	telnet_input(&ts, agree, 3, out, sizeof(out));
+	CHECK(s.out_len == 0, "the second one gets silence");
+}
+
+static void test_unknown_option_still_refused(void)
+{
+	struct TelnetState ts; struct Sink s;
+	const unsigned char will[] = { 255, 251, 99 };
+	unsigned char out[16];
+
+	printf("an option we do not implement is still refused\n");
+	setup(&ts, &s);
+	telnet_start(&ts);
+	s.out_len = 0;
+	telnet_input(&ts, will, 3, out, sizeof(out));
+	CHECK(s.out_len == 3 && s.out[1] == 254 && s.out[2] == 99, "DONT for option 99");
+}
+
 static void test_opening_offer(void)
 {
 	struct TelnetState ts; struct Sink s;
@@ -341,6 +460,12 @@ int main(void)
 	test_output_bare_cr_becomes_cr_nul();
 	test_output_trailing_cr_is_not_held();
 	test_output_255_and_newline_together();
+	test_dont_after_agreement_is_honoured();
+	test_dont_answering_our_offer_is_silent();
+	test_wont_for_an_option_he_was_doing();
+	test_unsolicited_do_is_accepted_not_ignored();
+	test_repeat_agreement_is_silent();
+	test_unknown_option_still_refused();
 	test_opening_offer();
 	test_crlf_becomes_newline();
 	test_cr_nul_is_a_bare_cr();
