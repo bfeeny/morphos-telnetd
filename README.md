@@ -206,22 +206,6 @@ decision here follows from that, and a candid list of what it does not do.
 `doc/PRIOR-ART.md` records what was surveyed first. `doc/SECURITY.md` is honest
 about what telnet does and does not protect.
 
-## Credits
-
-By Brian Feeny, built with Claude (Anthropic Claude Code).
-
-Developed by directing a set of Claude Code agents in specialised roles — one
-implementing the daemon, a separate one independently certifying each build,
-others on adjacent platform work.
-
-That split was not decoration, and it is worth one honest sentence because it
-shaped the result: **the most important behaviour in this daemon — a valid
-password serving a shell — was verified by a different agent than the one that
-wrote it, from a client that agent never wrote, with credentials it did not
-hold.** The implementing agent has never once confirmed it. Several real
-defects were found the same way, by the half of the work its author was
-structurally unable to test.
-
 ## Licence
 
 MIT. This is a clean implementation against the MorphOS SDK headers and
