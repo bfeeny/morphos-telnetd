@@ -22,3 +22,8 @@ dist/
 
 # built probe binary (PPC, rebuild with probe/Makefile)
 probe/conprobe
+
+# release staging
+telnetd-[0-9]*/
+telnetd-*.lha
+telnetd-*.tar.gz
