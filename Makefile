@@ -50,11 +50,17 @@ DISTDIR  = telnetd-$(VERSION)
 
 dist: $(TARGET)
 	@rm -rf $(DISTDIR) $(DISTDIR).lha $(DISTDIR).tar.gz
-	mkdir -p $(DISTDIR)/doc $(DISTDIR)/tools
+	mkdir -p $(DISTDIR)/doc $(DISTDIR)/tools $(DISTDIR)/src $(DISTDIR)/tests
 	cp $(TARGET) $(DISTDIR)/
-	cp README.md LICENSE $(DISTDIR)/
+	cp README.md LICENSE Makefile $(DISTDIR)/
 	cp doc/*.md $(DISTDIR)/doc/
 	cp tools/mkpw.c $(DISTDIR)/tools/
+	@# Source too, and not as a courtesy: the LICENSE in this archive grants
+	@# rights to source, so an archive without it is an MIT licence over
+	@# something the reader cannot see. It also makes the .lha rebuildable on
+	@# its own rather than only alongside a clone.
+	cp src/*.c src/*.h $(DISTDIR)/src/
+	cp tests/*.c tests/*.sh tests/*.py $(DISTDIR)/tests/
 	@# Lhasa -- the lha usually found on Linux and macOS -- can only EXTRACT.
 	@# Pack on a MorphOS machine with C:LhA, or anywhere with a real archiver;
 	@# otherwise leave a .tar.gz, which is honest rather than a broken .lha.

@@ -35,7 +35,7 @@ void console_init(struct ConsoleState *st,
 	 *
 	 * Answering CSI SP q with silence is not a benign degradation: the
 	 * program that asked blocks forever waiting for a reply, and takes the
-	 * session with it. Measured by AmigaCode with a client that offers no
+	 * session with it. Measured with a client that offers no
 	 * NAWS at all -- the shell never came back.
 	 *
 	 * 80x24 is ixemul's own fallback and what every ported program already
@@ -373,7 +373,7 @@ struct ConsoleReply console_dispatch(struct ConsoleState *st,
 		 *
 		 * We are "linux compatible" in precisely the sense meant: bytes
 		 * go to a stream whose other end wants LF. Source and reasoning
-		 * from morphos-oracle, out of the ixemul source.
+		 * read out of the ixemul source.
 		 */
 		st->session_mode_asks++;
 		r.res1 = DOSTRUE;

@@ -431,7 +431,7 @@ static LONG         cfg_netwait   = 0;
  * The log is opened, appended to, and closed FOR EVERY LINE.
  *
  * It used to be held open for the daemon's whole life, and that had two
- * consequences, both reported from the far end by amigacode.
+ * consequences, both reported from the far end by a second implementer.
  *
  * A running daemon's log could not be read AT ALL -- Type, Copy and a POSIX
  * read all failed with "object is in use" -- so the only way to see what a
@@ -1012,7 +1012,7 @@ static struct FileHandle *make_handle(struct MsgPort *port, LONG mode, LONG id)
  * WHY IT MATTERS: ixemul turns fstat() into this packet, so EVERY ixemul binary
  * in the SDK stats its console. Refusing it looked harmless because pdksh
  * ignores the failure -- but that is luck, not design, and the trail only
- * started because amigacode mis-reported pdksh as unusable over telnet and I
+ * started because pdksh was mis-reported as unusable over telnet and I
  * went looking for a fault in this handler.
  *
  * WHAT TO PUT IN IT, from ixemul's own source rather than guesswork
@@ -2053,9 +2053,9 @@ static void daemon_main(void)
 	 *
 	 * The message was worse than the bug. It said "port in use?" for ANY
 	 * bind failure -- mapping every cause onto the most familiar one -- and
-	 * cost amigacode a hunt for a collision that did not exist. It now
+	 * cost somebody a hunt for a collision that did not exist. It now
 	 * reports the errno and says nothing it does not know. Diagnosis by
-	 * amigacode, who had the log and read it properly.
+	 * reading the log properly rather than inferring from the symptom.
 	 *
 	 * With no -n this is still exactly one attempt, so starting on a port
 	 * somebody else holds still fails at once.
@@ -2326,7 +2326,7 @@ done:
 	 * that reclaims nothing, that is a lock held by nobody until the next
 	 * reboot -- so the boot that failed made its own explanation
 	 * unreadable, and the only thing that could say why refused to open.
-	 * Reported from the far end by amigacode, who had a silent port, a
+	 * Reported from the far end by somebody who had a silent port, a
 	 * locked 39-byte log and no way to see inside it.
 	 *
 	 * A failure must never take its reason with it.

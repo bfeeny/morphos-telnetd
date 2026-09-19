@@ -7,7 +7,9 @@
 # machine with no memory protection -- or letting a stranger in. So it is all
 # exercised here, where a mistake costs nothing.
 #
-# See "The testing rule" in the vault (MorphOS/Reaching Morphy.md).
+# THE TESTING RULE: never let the thing under test be the only guard between a
+# test and a destroyed machine. To prove something is refused, assert the
+# verdict in a unit test -- do not run the destructive command.
 
 set -e
 

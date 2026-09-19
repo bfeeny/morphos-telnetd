@@ -8,7 +8,7 @@ and the only ones with no tests.  They can only be exercised against the real
 thing, so this drives the real thing and asserts on what comes back.
 
 It is SAFE BY CONSTRUCTION -- it opens sockets and types.  Nothing here runs a
-destructive command on Morphy, and the one thing that could (checking for
+destructive command on the target, and the one thing that could (checking for
 stranded processes) is a read-only `status` through the job queue, run by hand.
 
     python3 tests/hwtest.py <host> <port> <user> <password> [test...]
@@ -161,7 +161,7 @@ def test_disconnect_midcommand(host, port, user, pw):
         t.close()                                  # and vanish mid-flight
     except Exception as e:
         return fail("disconnect", e)
-    ok("disconnected mid-command (now check Status on Morphy)")
+    ok("disconnected mid-command (now check Status on the target)")
     print("       -> expect NO leftover 'telnetd session' process,")
     print("          and 'reaped a console' or 'session ended' in the log")
     return True

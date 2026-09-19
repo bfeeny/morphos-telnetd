@@ -4,7 +4,7 @@
  * These run on the BUILD HOST and never on MorphOS. That is the point: this
  * is the code whose failure mode is "the whole OS goes down, taking every
  * other agent's work with it", so it gets exercised somewhere a mistake costs
- * nothing. See "The testing rule" in the vault: never let the thing under test
+ * nothing. THE TESTING RULE: never let the thing under test
  * be the only guard between a test and a destroyed machine.
  *
  * Build and run with tests/run.sh.

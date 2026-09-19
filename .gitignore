@@ -27,3 +27,7 @@ probe/conprobe
 telnetd-[0-9]*/
 telnetd-*.lha
 telnetd-*.tar.gz
+
+# python bytecode caches
+__pycache__/
+*.pyc

@@ -133,13 +133,15 @@ and the reason is now clear:
   neither of those. They are internal Shell commands, so there is nothing to
   exec directly.
 
-> [!important] Likely revision: the handler may need a name after all
-> This document previously said `NP_ConsoleTask` needs no `MakeDosEntry` and no
-> mounted device. That is true for **receiving packets**, which is proven. It
-> appears **not** to be true for starting an interactive Shell, because
-> `NewShell` wants a window description — a DOS device name it can open.
+> [!note] Resolved: the handler does need a name
+> This document once said `NP_ConsoleTask` needs no `MakeDosEntry` and no
+> mounted device. That is true for **receiving packets** — but not for starting
+> an interactive Shell, because `NewShell` wants a window description: a DOS
+> device name it can open.
 >
-> That points squarely at what `ttyhandler` did in 1996: **mount the handler
-> under a name** (it used `TTY:`) and then start the Shell on it. Our design
-> would become `MakeDosEntry`/`AddDosEntry` a per-session device, then
-> `NewShell <name>:`. Being asked of `morphos-oracle`; not yet confirmed.
+> That is what `ttyhandler` did in 1996 (it used `TTY:`), and it is what this
+> daemon does. Each session `MakeDosEntry`/`AddDosEntry`s its own device and
+> starts the Shell on it. The name carries the listening TCP port as well as a
+> per-session letter — `T2320A`, `T2320B` — because two daemons on different
+> ports would otherwise collide on the same name, which was measured: only the
+> first to ask got a Shell.

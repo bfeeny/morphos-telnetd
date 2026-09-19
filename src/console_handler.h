@@ -31,7 +31,7 @@
  * ACTION_SESSION_MODE is IXEMUL'S OWN PACKET, not AmigaDOS's. It is defined in
  * ixemul.library/library/_cli_parse.c:60 and appears in no SDK header, which is
  * why it arrives as an unidentifiable 991 and only ever from ixemul binaries.
- * Identified by morphos-oracle from the ixemul source.
+ * Identified from the ixemul source, which defines it.
  */
 #define ACTION_SESSION_MODE 991
 
