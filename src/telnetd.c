@@ -49,16 +49,20 @@ struct Library *SocketBase = NULL;
 struct Library *UserGroupBase = NULL;
 
 /*
- * Development bypass for authentication.
+ * THERE IS NO WAY TO BYPASS AUTHENTICATION. That is deliberate and it is a
+ * release requirement, not a default.
  *
- * OFF by default, and it has to stay that way: the whole point of the policy is
- * that a MorphOS account with no password refuses remote login, and a bypass
- * that could be reached by accident would undo it. It exists because the
- * machine's owner is not always present to type a password, and it announces
- * itself in the log AND to the connecting client so it can never be running
- * unnoticed.
+ * A `-a` flag used to disable the login entirely, for development on a machine
+ * whose owner was not always around to type a password. It was off by default
+ * and it announced itself loudly, and it is still gone: this is software other
+ * people will build from source and redistribute, and a daemon that can be
+ * compiled or invoked into handing out an unauthenticated shell is a footgun
+ * aimed at whoever packages it next. Removing it makes the guarantee
+ * structural -- true of every build, rather than of correctly-configured ones.
+ *
+ * Testing that needs a shell uses a real account, which is what everything
+ * else has to use anyway.
  */
-static int allow_no_auth = 0;
 
 /*
  * FIONBIO, spelled out.
@@ -1419,17 +1423,6 @@ static int session_start(struct Session *s, LONG sock, LONG session_no)
 	console_init(&s->con, shell_read, shell_write, s, 2, 0);
 	telnet_start(&s->tn);
 
-	if (allow_no_auth)
-	{
-		say("telnetd: WARNING -- authentication bypassed (-a)\n");
-		net_write_str(s, (CONST_STRPTR)
-			"\r\n*** WARNING: this telnetd is running with authentication DISABLED ***\r\n\r\n");
-		if (!session_launch_shell(s))
-			session_bye(s, (CONST_STRPTR)
-				"\r\ntelnetd: could not create a console for this session.\r\n");
-		return 1;
-	}
-
 	if (UserGroupBase == NULL)
 	{
 		say("telnetd: usergroup.library unavailable; refusing all logins\n");
@@ -1794,13 +1787,24 @@ int main(int argc, char **argv)
 			while (*q >= '0' && *q <= '9') v = v * 10 + (*q++ - '0');
 			cfg_netwait = v;
 		}
-		else if (argv[i][0] == '-' && argv[i][1] == 'a')
-		{
-			allow_no_auth = 1;
-		}
 		else if (argv[i][0] == '-' && argv[i][1] == 'd')
 		{
 			detach_me = 1;
+		}
+		else if (argv[i][0] == '-' && argv[i][1] == 'a')
+		{
+			/*
+			 * -a used to disable authentication. It is gone, and
+			 * saying so matters more than ignoring it would: a
+			 * script carrying the old flag otherwise gets a daemon
+			 * that behaves differently from the one it asked for,
+			 * with nothing anywhere to say why. Refuse rather than
+			 * start, so the difference cannot pass unnoticed.
+			 */
+			say("telnetd: -a (disable authentication) no longer exists.\n");
+			say("telnetd: this build cannot serve an unauthenticated shell.\n");
+			say("telnetd: use an account with a password set in Preferences.\n");
+			return RETURN_ERROR;
 		}
 		else if (argv[i][0] == '-' && argv[i][1] == 'r' && i + 1 < argc)
 		{
@@ -1949,8 +1953,6 @@ static void daemon_main(void)
 	say_num("telnetd: port = ", cfg_port);
 	say_num("telnetd: network wait secs = ", cfg_netwait);
 	say_num("telnetd: first-connection timeout secs = ", cfg_wait);
-	if (allow_no_auth)
-		say("telnetd: *** AUTHENTICATION DISABLED ***\n");
 
 	/*
 	 * Wait for the network stack, if asked to.
@@ -2019,9 +2021,12 @@ static void daemon_main(void)
 		tags[0].ti_Data = 0;
 		ug_SetupContextTagList((CONST_STRPTR)"telnetd", tags);
 	}
-	if (UserGroupBase == NULL && !allow_no_auth)
+	if (UserGroupBase == NULL)
 	{
-		say("telnetd: usergroup.library not available and no bypass given.\n");
+		/* No database means no way to check a password, and there is no
+		 * longer any flag that could talk us past that. Refusing to
+		 * start is the only safe answer. */
+		say("telnetd: usergroup.library not available, so no login can be checked.\n");
 		say("telnetd: refusing to start rather than serve unauthenticated shells.\n");
 		CloseLibrary(SocketBase);
 		SocketBase = NULL;
@@ -2140,8 +2145,6 @@ static void daemon_main(void)
 	say(bind_addr ? bind_addr : (CONST_STRPTR)"all interfaces");
 	say_num(" port ", port_no);
 	say_num("telnetd: concurrent sessions = ", MAX_SESSIONS);
-	if (allow_no_auth)
-		say("telnetd: *** AUTHENTICATION DISABLED (-allow-no-auth) ***\n");
 
 	/*
 	 * ONE LOOP, EVERY SESSION.

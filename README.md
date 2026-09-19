@@ -38,7 +38,7 @@ it is exercised where a mistake costs nothing.
 ## Run
 
 ```
-telnetd [-p port] [-b address] [-d] [-t seconds] [-l logfile] [-a]
+telnetd [-p port] [-b address] [-d] [-t seconds] [-n seconds] [-l logfile]
 
   -p   port to listen on            (default 23)
   -b   bind to one address          (default: all interfaces)
@@ -46,7 +46,6 @@ telnetd [-p port] [-b address] [-d] [-t seconds] [-l logfile] [-a]
   -t   seconds to wait for the first connection, 0 = forever
   -n   seconds to wait for the network stack (for boot scripts)
   -l   write diagnostics to a file
-  -a   DISABLE AUTHENTICATION -- development only, see SECURITY.md
 ```
 
 Typical supervised start:

@@ -69,22 +69,43 @@ Further, and independent of telnet:
   convention is safe there *because* `inetd` runs `login` first. Bind narrowly
   if you are unsure.
 
-## The development bypass
+## There is no way to disable authentication
 
-`-a` disables authentication entirely, for development on a machine whose owner
-is not present to type a password.
+Earlier versions had a `-a` flag that skipped the login, for development on a
+machine whose owner was not always present to type a password. **It has been
+removed.** Passing `-a` now makes the daemon refuse to start and say why, so a
+script carrying the old flag cannot quietly get a different daemon from the one
+it asked for.
 
-It is **off by default**, it announces itself in the log, and it announces
-itself **to the connecting client**. It exists so that work can continue without
-a credential; it is not a supported way to run the daemon. If you see the
-warning banner on connect, the daemon is serving unauthenticated shells.
+The guarantee is deliberately **structural rather than procedural**: it is not
+that the bypass defaults to off, or that release builds are configured without
+it — there is no code in the binary that can serve a session without checking a
+password. A compile-time switch was considered and rejected for the same reason.
+This is software that other people will build from source and redistribute, and
+a daemon that can be *compiled* into handing out an unauthenticated shell is a
+footgun aimed at whoever packages it next.
 
-Without the bypass, if `usergroup.library` cannot be opened the daemon
-**refuses to start** rather than falling back to serving unauthenticated
-sessions. Failing to start is a visible fault; failing open is a silent one.
+Consequences worth stating plainly:
+
+- **If `usergroup.library` cannot be opened, the daemon refuses to start.**
+  There is no longer any flag that could talk it past that. Failing to start is
+  a visible fault; failing open is a silent one.
+- **An account with no password, or one locked with `*`, is refused** rather
+  than admitted. The out-of-the-box MorphOS state is a blank password.
+- **Testing needs a real account**, the same as any other use. That is a
+  deliberate cost: the alternative was a special case in the daemon that existed
+  only for us.
 
 ## Status
 
-Authentication is implemented but **not yet verified against a real account** —
-it has been exercised only through its host-side policy tests. Until it has been
-run against a MorphOS user with a password set, treat it as untested code.
+**Authentication is implemented and exercised on real hardware**, against real
+accounts in the system user database, including sustained programmatic use by
+the fleet's job runner. A wrong password is refused with a single message that
+does not distinguish "no such user" from "wrong password" from "no password
+set"; a correct one gets a shell.
+
+What that does **not** mean: this has had no outside security review, and the
+protocol underneath it is plaintext. See the top of this document. The auth path
+has had two adversarial code reviews, which found real defects in it — including
+a denial of service reachable before login — and those are fixed, but "reviewed
+twice and fixed" is not "proven".
