@@ -4,7 +4,7 @@
  * getpwnam() and crypt() cannot run here; the DECISION they feed can, and the
  * decision is the part that must not be wrong. Testing "this must be refused"
  * by asserting a verdict rather than by attempting a login is the same rule
- * this fleet adopted after nearly formatting a disk to prove a guard worked.
+ * adopted here after nearly formatting a disk to prove a guard worked.
  */
 
 #include "../src/auth.h"

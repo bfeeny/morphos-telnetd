@@ -332,8 +332,8 @@ static struct FileHandle *make_handle(struct MsgPort *port, LONG mode, LONG id)
  * The first interactive run proved the probe could wait forever: the Shell
  * stayed alive holding our handles, the packet loop had nothing to do, and
  * `bounded 60` could not help because a MorphOS process parked in Wait() does
- * not answer to a shell-level kill. It sat on the queue until the agent's own
- * 900s watchdog fired, and the process itself survived that.
+ * not answer to a shell-level kill. It sat on the queue until the calling
+ * job's own 900s watchdog fired, and the process itself survived that.
  *
  * An instrument that can strand the machine it measures is not finished. So
  * the probe now carries its own clock: at the first deadline it starts
@@ -468,7 +468,7 @@ int main(int argc, char **argv)
 	 */
 	/*
 	 * Canned commands rather than free text. There are three shells between
-	 * the build host and this program -- bash, the agent's pdksh, and
+	 * the build host and this program -- bash, a remote pdksh, and
 	 * AmigaDOS -- and "NewShell *" arrived here as 'NewShell "', which
 	 * NewShell rejected with rc=10. Anything containing a quote or a star
 	 * cannot survive that trip intact, so the interesting commands are
@@ -803,7 +803,7 @@ int main(int argc, char **argv)
 	 * We do NOT DeleteMsgPort(port), and we do NOT free the two FileHandles.
 	 * The helper closed the handles; freeing a port a Shell might still hold
 	 * a handle to is the one mistake here that takes down the whole OS rather
-	 * than failing politely -- along with whatever the other agents sharing
+	 * than failing politely -- along with whatever else was sharing
 	 * this machine were doing.
 	 *
 	 * The only thing that could vouch for it being safe is our own packet

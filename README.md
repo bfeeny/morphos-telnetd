@@ -12,7 +12,7 @@ it, because the intended second consumer is an `sshd`.
 ## Status
 
 **In daily use**, on MorphOS 3.20 (PowerBook G4), as the inbound channel for a
-small fleet of machines — including one occasion when it was the only way into a
+small group of machines — including one occasion when it was the only way into a
 machine whose other remote channel had wedged, which is what it was built for.
 
 - authenticated login against the system's own user database

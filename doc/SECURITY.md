@@ -100,7 +100,7 @@ Consequences worth stating plainly:
 
 **Authentication is implemented and exercised on real hardware**, against real
 accounts in the system user database, including sustained programmatic use by
-the fleet's job runner. A wrong password is refused with a single message that
+an automated client. A wrong password is refused with a single message that
 does not distinguish "no such user" from "wrong password" from "no password
 set"; a correct one gets a shell.
 
