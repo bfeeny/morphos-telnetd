@@ -2,9 +2,9 @@
  * Host-side tests for the shell-attach packet logic.
  *
  * These run on the BUILD HOST and never on MorphOS. That is the point: this
- * is the code whose failure mode is "the whole OS goes down, taking every
- * other agent's work with it", so it gets exercised somewhere a mistake costs
- * nothing. THE TESTING RULE: never let the thing under test
+ * is the code whose failure mode is "the whole machine goes down, taking
+ * everything else running on it too", so it gets exercised somewhere a mistake
+ * costs nothing. THE TESTING RULE: never let the thing under test
  * be the only guard between a test and a destroyed machine.
  *
  * Build and run with tests/run.sh.

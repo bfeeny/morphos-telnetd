@@ -4,9 +4,8 @@
  *   mkpw <user> <password> [uid] [gid]          -> writes a TEST file
  *   mkpw -live <user> <password> [uid] [gid]     -> writes the system database
  *
- * THE LIVE DATABASE REQUIRES AN EXPLICIT FLAG. This tool writes
- * Work:morphos-agent/work-telnetd/passwd.test by default and touches nothing
- * the system reads. That is not caution for its own sake: writing the live path
+ * THE LIVE DATABASE REQUIRES AN EXPLICIT FLAG. Without -live this tool writes
+ * passwd.test in the current directory and touches nothing the system reads. That is not caution for its own sake: writing the live path
  * on every test run destroyed the machine owner's account, and very possibly
  * the only copy of a credential we were trying to locate. A tool that mutates
  * shared state as its DEFAULT behaviour will eventually do it at the worst
