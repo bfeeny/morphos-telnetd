@@ -34,56 +34,54 @@ clean:
 	rm -rf telnetd-*.lha telnetd-[0-9]*
 	@$(MAKE) -C probe clean
 
-# The release artifact.
+# The release artifact: an .lha for Aminet and MorphOS Storage.
 #
-# An .lha with the binary and the docs, which is the idiomatic level for a
-# single-binary daemon on this platform -- an Installer script would be
-# gold-plating for something that is one Copy command. Source stays in the
-# repo; this is what somebody downloads who does not want a cross-toolchain,
-# and most MorphOS users will not stand one up to get a telnetd.
+# LHA MUST BE AN IMPLEMENTATION THAT CAN *CREATE* ARCHIVES, and the one you
+# probably have cannot. `brew install lha` gives you Lhasa, which is
+# extract-only; 7-Zip lists Lzh but returns E_NOTIMPL if asked to write one.
 #
+# Creating implementations exist -- this is a packaging quirk, not a gap in the
+# world. LHa for UNIX 1.14i (github.com/jca02266/lha) writes .lha and MacPorts
+# ships it as `lha`. Its licence restricts binary redistribution, which is very
+# likely why Homebrew and the Linux distributions ship the clean-room
+# extract-only Lhasa under the same command name. Built from source here and
+# installed as `lha-unix` so it does not shadow Homebrew's.
+#
+# Override with:  make dist LHA=/path/to/creating/lha
+LHA     ?= lha-unix
+VERSION ?= 1.0
+PKG      = telnetd.ppc-morphos
+
 # The binary is NOT stripped, deliberately: LogTool can symbolicate a crash
 # dump against an unstripped binary and cannot against a stripped one, and
 # after a crash that is the only chance anyone gets.
-VERSION ?= 1.0
-DISTDIR  = telnetd-$(VERSION)
-
 dist: $(TARGET)
-	@rm -rf $(DISTDIR) $(DISTDIR).lha $(DISTDIR).tar.gz
-	mkdir -p $(DISTDIR)/doc $(DISTDIR)/tools $(DISTDIR)/src $(DISTDIR)/tests
-	cp $(TARGET) $(DISTDIR)/
-	cp README.md LICENSE Makefile $(DISTDIR)/
-	cp doc/*.md $(DISTDIR)/doc/
-	cp tools/mkpw.c $(DISTDIR)/tools/
-	@# Source too, and not as a courtesy: the LICENSE in this archive grants
-	@# rights to source, so an archive without it is an MIT licence over
-	@# something the reader cannot see. It also makes the .lha rebuildable on
-	@# its own rather than only alongside a clone.
-	cp src/*.c src/*.h $(DISTDIR)/src/
-	cp tests/*.c tests/*.sh tests/*.py $(DISTDIR)/tests/
-	@# Packing .lha needs an archiver that can CREATE the format, and the one
-	@# you probably have cannot. `brew install lha` gives you Lhasa, which is
-	@# extract-only; 7-Zip lists Lzh but refuses to write it (E_NOTIMPL).
-	@#
-	@# Creating implementations DO exist -- this is not a gap in the world,
-	@# only in the default install. LHa for UNIX 1.14i (github.com/jca02266/lha)
-	@# writes .lha and is packaged by MacPorts as `lha`; its licence restricts
-	@# binary redistribution, which is very likely why Homebrew and the Linux
-	@# distributions ship the clean-room extract-only Lhasa instead.
-	@#
-	@# So: MacPorts `lha`, or LHa built from source, or C:LhA on a MorphOS
-	@# machine. Failing all three, leave a .tar.gz -- honest beats a half-made
-	@# .lha.
-	@if lha a $(DISTDIR).lha $(DISTDIR) >/dev/null 2>&1 && [ -f $(DISTDIR).lha ]; then \
-		echo "--- packed $(DISTDIR).lha ---"; \
-	else \
-		COPYFILE_DISABLE=1 tar --no-xattrs -czf $(DISTDIR).tar.gz $(DISTDIR); \
-		echo "--- no archiver that can CREATE .lha; wrote $(DISTDIR).tar.gz ---"; \
-		echo "    On MorphOS:  LhA -r a $(DISTDIR).lha $(DISTDIR)"; \
-		echo "    (-r matters: LhA does NOT recurse by default and will"; \
-		echo "     silently archive only the top-level files)"; \
-	fi
-	@ls -l $(DISTDIR).lha $(DISTDIR).tar.gz 2>/dev/null || true
-	@rm -rf $(DISTDIR)
+	@rm -rf release
+	mkdir -p release/telnetd/doc release/telnetd/src release/telnetd/tests release/telnetd/tools
+	cp $(TARGET) release/telnetd/
+	cp README.md LICENSE Makefile release/telnetd/
+	cp doc/*.md release/telnetd/doc/
+	@# Source ships too, and not as a courtesy: the LICENSE in this archive
+	@# grants rights to source, so an archive without it is an MIT licence
+	@# over something the reader cannot see. It also makes the package
+	@# rebuildable on its own rather than only alongside a clone.
+	cp src/*.c src/*.h release/telnetd/src/
+	cp tests/*.c tests/*.sh tests/*.py release/telnetd/tests/
+	cp tools/mkpw.c release/telnetd/tools/
+	@find release -name '._*' -o -name '.DS_Store' | xargs rm -f 2>/dev/null || true
+	@# Aminet requires the readme to share the archive's base name.
+	cp packaging/$(PKG).readme release/
+	@cd release && $(LHA) a $(PKG).lha telnetd >/dev/null 2>&1 || { \
+		echo "ERROR: $(LHA) cannot create archives."; \
+		echo "  Lhasa (Homebrew's 'lha') and 7-Zip extract only."; \
+		echo "  Use MacPorts 'lha', or build github.com/jca02266/lha,"; \
+		echo "  or pass LHA=/path/to/one that can."; exit 1; }
+	@rm -rf release/telnetd
+	@echo
+	@echo "--- release/$(PKG).lha ---"
+	@$(LHA) l release/$(PKG).lha | tail -n +1
+	@echo
+	@ls -l release/
 
 .PHONY: all test probe clean dist
+

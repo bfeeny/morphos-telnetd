@@ -1,0 +1,65 @@
+Short:        Telnet daemon, remote shell for MorphOS
+Uploader:     <YOUR EMAIL HERE> (Brian Feeny)
+Author:       <YOUR EMAIL HERE> (Brian Feeny)
+Type:         comm/tcp
+Version:      1.0
+Architecture: ppc-morphos
+Distribution: Aminet
+Requires:     MorphOS 3.x, bsdsocket.library, usergroup.library (both ship with MorphOS)
+
+A telnet daemon for MorphOS - a remote shell for a platform that has never had
+one.
+
+MorphOS ships OpenSSH as a client only. There is no sshd, no telnetd, and no
+working inetd, so nothing can drive the machine remotely. This fills that gap.
+
+FEATURES
+
+ - Authenticated login against the system's own user database, via
+   usergroup.library. Accounts come from Preferences -> Users.
+ - Several concurrent sessions from a single process.
+ - Window size (NAWS) carried end to end, so full-screen programs know their
+   geometry.
+ - Starts at boot and comes back on its own after a reboot.
+ - An interactive pdksh works over it, as well as the MorphOS Shell.
+ - Survives idle clients, mid-command disconnects, and clients that flood
+   without reading.
+
+THERE IS NO WAY TO DISABLE AUTHENTICATION. An account with no password, or one
+locked with *, is refused rather than admitted - the out-of-the-box MorphOS
+state is a blank password, and failing open would hand a shell to anyone who
+connects. No build of this daemon, however compiled or invoked, can serve an
+unauthenticated shell.
+
+TELNET IS A PLAINTEXT PROTOCOL. Credentials and session content cross the
+network in the clear. Run it on a trusted LAN or through a tunnel, and read
+doc/SECURITY.md before putting it anywhere else. This has had no outside
+security review.
+
+INSTALLATION
+
+ Copy telnetd TO C:
+
+ To start it at boot, put it in S:user-network-startup - NOT S:User-Startup.
+ The startup-sequence never calls the network chain, so User-Startup runs
+ before any interface has an address and bind() fails. The README explains
+ this with the measurements behind it.
+
+HOW IT WORKS
+
+A telnet daemon spawns a shell and wires it to a socket. On Unix that is a
+pseudo-terminal, and the Amiga lineage has no ptys. The answer is that an
+AmigaDOS console is not a device node but a message port that answers packets,
+so this daemon points a spawned Shell at a port it owns and answers those
+packets itself. ACTION_WAIT_CHAR is select(); ACTION_SCREEN_MODE is the line
+discipline.
+
+The shell-attach layer is a standalone module with no networking in it, because
+the intended second consumer is an sshd.
+
+Full source is included, along with documentation covering the architecture, a
+comparison with Unix telnetd implementations (including a candid list of what
+this does not do), the prior-art survey, and the security posture.
+
+MIT licence. Clean implementation against the MorphOS SDK headers and autodocs;
+no GPL code was copied.
