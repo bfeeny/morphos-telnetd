@@ -61,9 +61,19 @@ dist: $(TARGET)
 	@# its own rather than only alongside a clone.
 	cp src/*.c src/*.h $(DISTDIR)/src/
 	cp tests/*.c tests/*.sh tests/*.py $(DISTDIR)/tests/
-	@# Lhasa -- the lha usually found on Linux and macOS -- can only EXTRACT.
-	@# Pack on a MorphOS machine with C:LhA, or anywhere with a real archiver;
-	@# otherwise leave a .tar.gz, which is honest rather than a broken .lha.
+	@# Packing .lha needs an archiver that can CREATE the format, and the one
+	@# you probably have cannot. `brew install lha` gives you Lhasa, which is
+	@# extract-only; 7-Zip lists Lzh but refuses to write it (E_NOTIMPL).
+	@#
+	@# Creating implementations DO exist -- this is not a gap in the world,
+	@# only in the default install. LHa for UNIX 1.14i (github.com/jca02266/lha)
+	@# writes .lha and is packaged by MacPorts as `lha`; its licence restricts
+	@# binary redistribution, which is very likely why Homebrew and the Linux
+	@# distributions ship the clean-room extract-only Lhasa instead.
+	@#
+	@# So: MacPorts `lha`, or LHa built from source, or C:LhA on a MorphOS
+	@# machine. Failing all three, leave a .tar.gz -- honest beats a half-made
+	@# .lha.
 	@if lha a $(DISTDIR).lha $(DISTDIR) >/dev/null 2>&1 && [ -f $(DISTDIR).lha ]; then \
 		echo "--- packed $(DISTDIR).lha ---"; \
 	else \
