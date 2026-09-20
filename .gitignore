@@ -1,4 +1,6 @@
 # Private local notes. Never commit: this is a public repository.
+CLAUDE.md
+.claude/
 .claude/CLAUDE.local.md
 CLAUDE.local.md
 
@@ -19,8 +21,15 @@ dist/
 # macOS
 .DS_Store
 
-# built probe binary (PPC, rebuild with probe/Makefile)
+# built probe binaries (PPC; rebuild with probe/Makefile)
 probe/conprobe
+probe/contest
+probe/mkpw
+probe/nitest
+probe/nitest2
+probe/nitest3
+probe/pwdump
+probe/starprobe
 
 # release staging
 telnetd-[0-9]*/

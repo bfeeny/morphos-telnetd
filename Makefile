@@ -67,9 +67,11 @@ dist: $(TARGET)
 	@if lha a $(DISTDIR).lha $(DISTDIR) >/dev/null 2>&1 && [ -f $(DISTDIR).lha ]; then \
 		echo "--- packed $(DISTDIR).lha ---"; \
 	else \
-		tar czf $(DISTDIR).tar.gz $(DISTDIR); \
+		COPYFILE_DISABLE=1 tar --no-xattrs -czf $(DISTDIR).tar.gz $(DISTDIR); \
 		echo "--- no archiver that can CREATE .lha; wrote $(DISTDIR).tar.gz ---"; \
-		echo "    On MorphOS:  LhA a $(DISTDIR).lha $(DISTDIR)"; \
+		echo "    On MorphOS:  LhA -r a $(DISTDIR).lha $(DISTDIR)"; \
+		echo "    (-r matters: LhA does NOT recurse by default and will"; \
+		echo "     silently archive only the top-level files)"; \
 	fi
 	@ls -l $(DISTDIR).lha $(DISTDIR).tar.gz 2>/dev/null || true
 	@rm -rf $(DISTDIR)
