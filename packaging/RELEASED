@@ -1,0 +1,22 @@
+# Versions that have been uploaded to Aminet and MorphOS Storage.
+#
+# `make dist` refuses to build any version listed here. Once a version is on
+# those sites, every later change needs a NEW version: re-uploading different
+# contents under the same number leaves the sites, and anyone who downloaded
+# it, unable to tell the two apart.
+#
+# To reproduce a released package exactly, check out its commit and build
+# there -- this file does not exist at that commit, so the guard does not fire.
+# Rebuilding an old version from a newer tree is precisely what this prevents.
+# `make dist` also refuses an uncommitted tree, so from 1.1 on a release
+# always corresponds to exactly one commit.
+#
+# version  commit   date        archive sha256
+1.0        4e02a4a* 2026-09-21  a6150d6b9979a26ed616331f25cce668441a570aa5b7d63b94dbe8367c0a4991
+#
+# * 1.0 is NOT exactly reproducible from any commit. It was built from a
+#   working tree that was 4e02a4a except for one paragraph of README.md (the
+#   "Releases" text as of 66cf153), because the README was edited after the
+#   build and before the commit. The binary inside is identical to every commit
+#   from faaad04 on (sha256 59dfe757...), as is the .readme. The preserved
+#   uploaded archive, not any commit, is the authoritative record of 1.0.

@@ -63,6 +63,27 @@ PKG      = telnetd.ppc-morphos
 # dump against an unstripped binary and cannot against a stripped one, and
 # after a crash that is the only chance anyone gets.
 dist: $(TARGET)
+	@# A version that has been uploaded is never rebuilt from a newer tree.
+	@# See packaging/RELEASED for the reasoning and how to reproduce one.
+	@if [ -f packaging/RELEASED ] && grep -q '^$(VERSION)[[:space:]]' packaging/RELEASED; then \
+		echo "ERROR: version $(VERSION) is already released."; \
+		echo "  Anything changed since then needs a new version number."; \
+		echo "  Latest released: $$(grep -v '^#' packaging/RELEASED | awk 'NF{v=$$1} END{print v}')"; \
+		echo "  Build with:      make dist VERSION=<next>"; \
+		echo "  To reproduce $(VERSION) exactly, check out its commit instead."; \
+		exit 1; fi
+	@# A release is built from a COMMITTED tree, never a working copy. 1.0 was
+	@# built, then README.md was edited, then committed -- so no commit
+	@# reproduces the archive that was uploaded. Refusing a dirty tree makes
+	@# every future release correspond to exactly one commit.
+	@# `git status --porcelain`, not `git diff`: diff ignores UNTRACKED files,
+	@# and this target copies src/*.c wholesale -- a stray untracked source
+	@# file would ship in the release without ever having been committed.
+	@if [ -n "$$(git status --porcelain)" ]; then \
+		echo "ERROR: uncommitted changes. Commit first, then build the release,"; \
+		echo "  so the package corresponds to exactly one commit:"; \
+		git status --short | sed 's/^/    /'; \
+		exit 1; fi
 	@rm -rf release
 	mkdir -p release/telnetd/doc release/telnetd/src release/telnetd/tests release/telnetd/tools
 	cp $(TARGET) release/telnetd/
