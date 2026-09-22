@@ -164,11 +164,25 @@ Source lives in this repository for anyone who wants to build or audit it; the
 `.lha` exists so that getting a telnetd does not require standing up a
 cross-toolchain first.
 
-`make dist` stages the tree. Note that the `lha` usually found on Linux and
-macOS is **Lhasa, which can only extract** — pack the final archive on a
-MorphOS machine (`LhA a telnetd-1.0.lha telnetd-1.0`) or with any archiver that
-can actually create the format. `make dist` falls back to a `.tar.gz` and tells
-you, rather than pretending.
+`make dist` produces the finished package in `release/`:
+
+```
+release/telnetd.ppc-morphos.lha
+release/telnetd.ppc-morphos.readme
+```
+
+**It needs an `lha` that can *create* archives, and the one you probably have
+cannot.** `brew install lha` gives you Lhasa, which only extracts, and 7-Zip
+lists the format but refuses to write it. Creating implementations do exist —
+LHa for UNIX ([github.com/jca02266/lha](https://github.com/jca02266/lha)), which
+MacPorts ships as `lha` — they are just not the default. Point the Makefile at
+one with `make dist LHA=/path/to/lha`; it stops with an explanation if the one
+it finds cannot write.
+
+To pack on MorphOS instead, **use `LhA -r a`**. The `-r` is not optional:
+AmigaDOS `LhA` does not recurse by default, and without it the archive silently
+contains only the top-level files — no source, no docs — while still reporting
+success.
 
 ## Build
 
