@@ -50,6 +50,13 @@ clean:
 # Override with:  make dist LHA=/path/to/creating/lha
 LHA     ?= lha-unix
 VERSION ?= 1.0
+
+# NO VERSION IN THE FILENAME, deliberately, and on Aminet's own instruction:
+# "Version numbers should be part of the readme file, not part of the
+# filename." Uploading again under the SAME name is how Aminet replaces a
+# package -- "the preferred way to do updates" -- so a stable name keeps one
+# listing, one link, and no trail of superseded versions. It also matters for
+# the 30-character limit, of which ".ppc-morphos.lha" already spends sixteen.
 PKG      = telnetd.ppc-morphos
 
 # The binary is NOT stripped, deliberately: LogTool can symbolicate a crash
@@ -70,7 +77,13 @@ dist: $(TARGET)
 	cp tools/mkpw.c release/telnetd/tools/
 	@find release -name '._*' -o -name '.DS_Store' | xargs rm -f 2>/dev/null || true
 	@# Aminet requires the readme to share the archive's base name.
-	cp packaging/$(PKG).readme release/
+	@# The version is STAMPED in, not typed: the readme is a template with
+	@# @VERSION@ where the number goes, so a release is `make dist
+	@# VERSION=1.1` and there is no second place to forget to edit.
+	sed 's/@VERSION@/$(VERSION)/' packaging/$(PKG).readme > release/$(PKG).readme
+	@grep -q '^Version: *$(VERSION)$$' release/$(PKG).readme || { \
+		echo "ERROR: the readme did not get Version $(VERSION) stamped in."; \
+		echo "  Check packaging/$(PKG).readme still has @VERSION@."; exit 1; }
 	@cd release && $(LHA) a $(PKG).lha telnetd >/dev/null 2>&1 || { \
 		echo "ERROR: $(LHA) cannot create archives."; \
 		echo "  Lhasa (Homebrew's 'lha') and 7-Zip extract only."; \

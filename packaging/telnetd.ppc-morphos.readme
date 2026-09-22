@@ -1,8 +1,8 @@
 Short:        Telnet daemon, remote shell for MorphOS
-Uploader:     <YOUR EMAIL HERE> (Brian Feeny)
-Author:       <YOUR EMAIL HERE> (Brian Feeny)
+Uploader:     bfeeny@mac.com (Brian Feeny)
+Author:       bfeeny@mac.com (Brian Feeny)
 Type:         comm/tcp
-Version:      1.0
+Version:      @VERSION@
 Architecture: ppc-morphos
 Distribution: Aminet
 Requires:     MorphOS 3.x, bsdsocket.library, usergroup.library (both ship with MorphOS)

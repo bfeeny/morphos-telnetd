@@ -164,7 +164,11 @@ Source lives in this repository for anyone who wants to build or audit it; the
 `.lha` exists so that getting a telnetd does not require standing up a
 cross-toolchain first.
 
-`make dist` produces the finished package in `release/`:
+`make dist VERSION=1.0` produces the finished package in `release/`, with the
+version stamped into the readme — `packaging/telnetd.ppc-morphos.readme` is a
+template, so there is no second place to edit per release. The filename carries
+**no** version, on Aminet's own instruction: the version belongs in the readme,
+and re-uploading under the same name is how Aminet replaces a package.
 
 ```
 release/telnetd.ppc-morphos.lha
